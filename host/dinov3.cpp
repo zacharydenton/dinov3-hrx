@@ -265,6 +265,7 @@ class Session {
     int session_max_batch = 0;
     int batch = 0, rows = 0, patch_rows = 0;
     bool use_splitk = false;
+    bool failed = false;
     std::mutex run_mutex;
 
     float *W(const std::string &name) {
@@ -589,7 +590,7 @@ class Session {
 
     // One batch: upload, run, download. `input` is batch x PATCHES x PATCH_K
     // f32, `output` is batch x TOKENS x HIDDEN f32.
-    void upload(const float *input, size_t input_elements, int b) {
+    void check_input(const float *input, size_t input_elements, int b) {
         if (!input)
             throw std::invalid_argument("input must not be null");
         set_batch(b);
@@ -600,6 +601,10 @@ class Session {
                     << b << " requires exactly " << expected;
             throw std::invalid_argument(message.str());
         }
+    }
+
+    void upload(const float *input, size_t input_elements, int b) {
+        check_input(input, input_elements, b);
         // Attention operates in 16-query tiles. Clear the tail of the packed
         // f16 QKV buffer so a smaller call cannot observe padding left by a
         // preceding larger call in the same resident session.
@@ -607,7 +612,7 @@ class Session {
         HIP_CHECK(hipMemset(reinterpret_cast<char *>(q) + qkv_bytes, 0,
                             size_t(16) * QKV * sizeof(uint16_t)));
         HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)image, (void *)input,
-                                expected * sizeof(float)));
+                                input_elements * sizeof(float)));
     }
 
     void synchronize() { HIP_CHECK(hipDeviceSynchronize()); }
@@ -630,6 +635,8 @@ class Session {
     void session_run(const float *input, size_t input_elements, float *output,
                      size_t output_elements, int b) {
         std::lock_guard<std::mutex> lock(run_mutex);
+        if (failed)
+            throw std::runtime_error("session is unusable after failed GPU recovery; create a new session");
         if (!output)
             throw std::invalid_argument("output must not be null");
         set_batch(b);
@@ -641,10 +648,18 @@ class Session {
                     << expected_output;
             throw std::invalid_argument(message.str());
         }
-        upload(input, input_elements, b);
-        forward();
-        synchronize();
-        download(output, output_elements);
+        check_input(input, input_elements, b);
+        try {
+            upload(input, input_elements, b);
+            forward();
+            synchronize();
+            download(output, output_elements);
+        } catch (...) {
+            // Finish earlier launches before another caller can reuse the
+            // session. Preserve the launch error and disable failed recovery.
+            if (hipDeviceSynchronize() != hipSuccess) failed = true;
+            throw;
+        }
     }
 
     void print_profile(int forwards) const {

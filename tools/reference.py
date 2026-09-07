@@ -28,7 +28,7 @@ def snapshot() -> Path:
     """
     override = os.environ.get("DINOV3_SNAPSHOT")
     if override:
-        return Path(override)
+        return Path(override).expanduser()
     try:
         from huggingface_hub import snapshot_download
     except ImportError:  # pragma: no cover - dependency guidance

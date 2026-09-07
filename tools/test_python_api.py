@@ -43,7 +43,6 @@ def cli(batch: np.ndarray) -> np.ndarray:
         output = Path(directory) / "output.bin"
         patchify(batch).tofile(source)
         environment = dict(os.environ)
-        environment.pop("LD_LIBRARY_PATH", None)
         subprocess.run(
             [str(ROOT / "host/dinov3"), "--weights", str(ROOT / "build/weights"),
              "--kernels", str(ROOT / "build/kernels"), "--input", str(source),

@@ -43,8 +43,7 @@ def torch_throughput(model, batch: int, dtype, steps: int = 20) -> float:
 
 
 def main() -> None:
-    image = np.load("/tmp/px.npy") if Path("/tmp/px.npy").exists() else \
-        np.random.default_rng(0).standard_normal((3, 224, 224))
+    image = np.random.default_rng(0).standard_normal((3, 224, 224))
     R.patchify(image).astype(np.float32).tofile(ROOT / "build/patchified.bin")
 
     print(f"DINOv3 ViT-S+/16, 224px, 201 tokens — {torch.cuda.get_device_name(0)}")

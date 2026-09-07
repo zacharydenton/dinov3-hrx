@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "DINOv3 ViT-S+/16 forward pass in AMD's Loom kernel language for gfx1151"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.11"
 dependencies = ["numpy>=2.3"]
 
 [project.optional-dependencies]

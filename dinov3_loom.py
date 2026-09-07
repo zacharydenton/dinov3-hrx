@@ -96,13 +96,16 @@ class DINOv3Loom:
         self.weights = _path(weights, "DINOV3_LOOM_WEIGHTS", ROOT / "build/weights")
         self.kernels = _path(kernels, "DINOV3_LOOM_KERNELS", ROOT / "build/kernels")
         self.library = _path(library, "DINOV3_LOOM_LIBRARY", ROOT / "build/libdinov3.so")
-        for path, hint in (
-            (self.library, "./scripts/build_host.sh"),
-            (self.kernels, "./scripts/build_kernels.sh"),
-            (self.weights, "python3 tools/export_weights.py"),
+        for path, environment, hint, source in (
+            (self.library, "DINOV3_LOOM_LIBRARY", "./scripts/build_host.sh", "scripts/build_host.sh"),
+            (self.kernels, "DINOV3_LOOM_KERNELS", "./scripts/build_kernels.sh", "scripts/build_kernels.sh"),
+            (self.weights, "DINOV3_LOOM_WEIGHTS", "python3 tools/export_weights.py", "tools/export_weights.py"),
         ):
             if not path.exists():
-                raise FileNotFoundError(f"{path} is missing; run: {hint}")
+                advice = f"set {environment} to its location"
+                if (ROOT / source).exists():
+                    advice += f" or run from the source checkout: {hint}"
+                raise FileNotFoundError(f"{path} is missing; {advice}")
 
         try:
             native = ctypes.CDLL(self.library)
@@ -189,6 +192,10 @@ class DINOv3Loom:
 
     def close(self) -> None:
         """Release all GPU allocations and loaded modules; safe to call twice."""
+        # A lock held by another parent thread cannot be acquired after fork.
+        if getattr(self, "_pid", os.getpid()) != os.getpid():
+            self._handle = None
+            return
         lock = getattr(self, "_lock", None)
         if lock is None:
             return
@@ -217,6 +224,7 @@ class DINOv3Loom:
 
     def __call__(self, pixel_values) -> np.ndarray:
         """Return ``(B, 201, 384)`` f32 tokens, splitting large batches."""
+        self._ensure_usable()
         value = pixel_values
         detach = getattr(value, "detach", None)
         if detach is not None:
@@ -229,6 +237,7 @@ class DINOv3Loom:
             array = array[None]
         patches = patchify(array)
 
+        self._ensure_usable()
         with self._lock:
             self._ensure_usable()
             pieces = [

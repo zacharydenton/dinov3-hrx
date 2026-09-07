@@ -33,6 +33,8 @@ int dinov3_create(const char *weights_dir, const char *kernels_dir,
 // ABI so an undersized caller allocation is rejected before the GPU sees it.
 // Calls using the same session are serialized internally. Destruction must not
 // race a run.
+// Failed launches trigger synchronization before returning. If recovery fails,
+// subsequent runs are rejected; destroy the session after resolving the GPU error.
 int dinov3_run(dinov3_session *session, const float *input,
                size_t input_elements, float *output, size_t output_elements,
                int batch, char *error, size_t error_capacity);

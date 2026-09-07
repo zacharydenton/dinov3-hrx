@@ -6,6 +6,7 @@ Compares the full 201x384 output, then the two embeddings anyone actually uses
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +38,6 @@ def main() -> int:
     # Keep torch on the CPU so the reference is exact f32 and does not fight the
     # runner for the GPU; the runner gets its own environment back below.
     gpu_env = dict(os.environ)
-    gpu_env.pop("HIP_VISIBLE_DEVICES", None)
     os.environ["HIP_VISIBLE_DEVICES"] = ""
     import torch
     from transformers import AutoModel
@@ -46,18 +46,15 @@ def main() -> int:
     ok = True
     for seed in (0, 1, 2):
         image = make_image(seed)
-        # Deliberately not build/patchified.bin: that file is the benchmark's
-        # input, and clobbering it here silently invalidates every hand
-        # comparison against a saved reference afterwards.
-        R.patchify(image).astype(np.float32).tofile("/tmp/validate_patchified.bin")
-        subprocess.run([str(ROOT / "host/dinov3"),
-                        "--weights", str(ROOT / "build/weights"),
-                        "--kernels", str(ROOT / "build/kernels"),
-                        "--input", "/tmp/validate_patchified.bin",
-                        "--output", "/tmp/loom_validate.bin"] + sys.argv[1:],
-                       check=True, cwd=ROOT,
-                       capture_output=True, env=gpu_env)
-        loom = np.fromfile("/tmp/loom_validate.bin", dtype=np.float32).reshape(R.TOKENS, R.HIDDEN)
+        with tempfile.TemporaryDirectory(prefix="dinov3-validate-") as directory:
+            source, output = Path(directory) / "patches.bin", Path(directory) / "tokens.bin"
+            R.patchify(image).astype(np.float32).tofile(source)
+            subprocess.run([str(ROOT / "host/dinov3"),
+                            "--weights", str(ROOT / "build/weights"),
+                            "--kernels", str(ROOT / "build/kernels"),
+                            "--input", str(source), "--output", str(output)] + sys.argv[1:],
+                           check=True, cwd=ROOT, capture_output=True, env=gpu_env)
+            loom = np.fromfile(output, dtype=np.float32).reshape(R.TOKENS, R.HIDDEN)
 
         with torch.no_grad():
             hf = model(pixel_values=torch.from_numpy(image[None]).float()) \
@@ -74,7 +71,6 @@ def main() -> int:
         print(f"  {'PASS' if good else 'FAIL'} image {seed}: "
               f"cosine full={full:.10f} cls={cls:.10f} mean-patch={mean:.10f} "
               f"max_abs={max_abs:.2e}")
-    print("\nreference: xdna-vision gates DINOv3 at cosine > 0.997")
     return 0 if ok else 1
 
 
