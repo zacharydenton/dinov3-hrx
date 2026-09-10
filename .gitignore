@@ -1,9 +1,4 @@
-build/
-host/dinov3
-host/loomrun
-experiments/rocwmma_gemm
-__pycache__/
-*.pyc
-*.egg-info/
-.venv/
-dist/
+/target/
+/build/
+*.onnx
+*.safetensors

@@ -1,0 +1,22 @@
+[package]
+name = "dinov3-hrx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "dinov3 inference with HRX and Loom"
+repository = "https://github.com/zacharydenton/dinov3-hrx"
+include = ["src/**", "kernels/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]
+
+[dependencies]
+hrx = { package = "hrx-rs", version = "0.4.0", default-features = false, features = ["download", "loom"] }
+anyhow = "1"
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+safetensors = "0.6"
+
+[dev-dependencies]
+matrixmultiply = "0.3"

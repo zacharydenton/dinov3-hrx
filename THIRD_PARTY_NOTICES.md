@@ -15,5 +15,5 @@ review the terms through the model page before downloading it. Exporting the
 weights into the Loom layout does not replace their model license.
 
 Neither the original model files nor exported weights are distributed in this
-repository or its Python packages. Redistributing model material requires
+repository or its Cargo package. Redistributing model material requires
 following Meta's terms, including the agreement and attribution requirements.
