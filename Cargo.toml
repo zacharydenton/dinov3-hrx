@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
-description = "dinov3 inference with HRX and Loom"
+description = "DINOv3 ViT-S+/16 inference in Rust for AMD GPUs with HRX and Loom"
 repository = "https://github.com/zacharydenton/dinov3-hrx"
 include = ["src/**", "kernels/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]
 
