@@ -1,6 +1,7 @@
 //! DINOv3 ViT-S+/16 at 224×224. Inputs are normalized RGB NCHW; outputs
 //! are 201 tokens of 384 float32 features per image. A model owns a GPU stream.
 mod engine;
+pub mod hub;
 mod weights;
 use anyhow::{Result, ensure};
 use engine::{Engine, Launch, Region};
@@ -33,6 +34,17 @@ pub struct DINOv3 {
     patched: Vec<f32>,
 }
 impl DINOv3 {
+    /// Load the pinned pretrained model from the Hugging Face cache, fetching it
+    /// if needed. Set `HF_HUB_OFFLINE=1` for cached weights only.
+    /// Use [`Self::load`] to supply a local file instead.
+    pub fn from_pretrained(options: Options) -> Result<Self> {
+        ensure!(
+            (1..=64).contains(&options.max_batch),
+            "max_batch must be 1..=64"
+        );
+        Self::load(hub::weights(false)?, options)
+    }
+
     /// Validate and pack the model, compile kernels, and allocate resident storage.
     pub fn load(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         ensure!(
@@ -47,9 +59,10 @@ impl DINOv3 {
         }
         let r = options.max_batch * 201;
         let p = options.max_batch * 196;
-        // x and patched are f32; h, QKV, attention and SwiGLU are f16.
+        // Residual x, h, QKV, attention and SwiGLU are f16.
+        // Patch embeddings, final output, images and split-K partials are f32.
         let sizes = [
-            r * 384 * 4,
+            r * 384 * 2,
             r * 384 * 2,
             (r + 16) * 1152 * 2,
             r * 384 * 2,

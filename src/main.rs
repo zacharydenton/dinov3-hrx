@@ -5,8 +5,12 @@ use std::{path::PathBuf, time::Instant};
 /// Run inference or measure warm end-to-end inference, including transfers.
 #[derive(Parser)]
 struct Args {
+    /// Local model file; otherwise fetch the pinned weights from Hugging Face.
     #[arg(long)]
-    model: PathBuf,
+    model: Option<PathBuf>,
+    /// Use only cached model weights.
+    #[arg(long)]
+    offline: bool,
     #[arg(long)]
     input: PathBuf,
     #[arg(long)]
@@ -21,8 +25,16 @@ struct Args {
 }
 fn main() -> Result<()> {
     let args = Args::parse();
+    ensure!(
+        (1..=64).contains(&args.max_batch),
+        "max_batch must be 1..=64"
+    );
     let input = std::fs::read(&args.input)?;
     let setup = Instant::now();
+    let model_path = match args.model {
+        Some(path) => path,
+        None => hub::weights(args.offline)?,
+    };
     ensure!(
         input.len().is_multiple_of(4),
         "input must be little-endian float32 NCHW RGB"
@@ -32,7 +44,7 @@ fn main() -> Result<()> {
         .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
         .collect();
     let mut model = DINOv3::load(
-        &args.model,
+        &model_path,
         Options {
             device: args.device,
             max_batch: args.max_batch,

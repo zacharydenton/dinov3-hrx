@@ -26,9 +26,9 @@ fn rejects_options_before_loading() {
     );
 }
 #[test]
-#[ignore = "requires DINOV3_MODEL and gfx1151"]
+#[ignore = "requires pretrained weights and gfx1151"]
 fn full_reference_and_changing_batch() -> Result<()> {
-    let path = std::env::var("DINOV3_MODEL")?;
+    let path = model_path()?;
     let mut model = DINOv3::load(
         &path,
         Options {
@@ -63,4 +63,11 @@ fn full_reference_and_changing_batch() -> Result<()> {
     assert!(model.forward(&[0.; 3]).is_err());
     assert!(model.forward(&vec![f32::NAN; IMAGE_ELEMENTS]).is_err());
     Ok(())
+}
+
+fn model_path() -> Result<std::path::PathBuf> {
+    match std::env::var_os("DINOV3_MODEL") {
+        Some(path) => Ok(path.into()),
+        None => dinov3_hrx::hub::weights(false),
+    }
 }
