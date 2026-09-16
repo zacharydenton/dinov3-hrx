@@ -40,10 +40,12 @@ fn main() -> Result<()> {
         "input must be little-endian float32 NCHW RGB"
     );
     let input: Vec<f32> = input
-        .chunks_exact(4)
-        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|x| f32::from_le_bytes(*x))
         .collect();
-    let mut model = DINOv3::load(
+    let model = DINOv3::load(
         &model_path,
         Options {
             device: args.device,
@@ -57,7 +59,7 @@ fn main() -> Result<()> {
             serde_json::to_string(&model.benchmark(&input, args.benchmark)?)?
         );
     }
-    let mut run = || model.forward(&input);
+    let run = || model.forward(&input);
     let output = run()?;
     if let Some(path) = args.output {
         std::fs::write(path, bytemuck::cast_slice(&output))?;

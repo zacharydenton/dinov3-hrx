@@ -58,8 +58,10 @@ pub fn forward(path: &Path, image: &[f32]) -> Result<Vec<f64>> {
         weights.insert(
             name,
             t.data()
-                .chunks_exact(4)
-                .map(|v| f32::from_le_bytes(v.try_into().unwrap()) as f64)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v) as f64)
                 .collect::<Vec<_>>(),
         );
     }

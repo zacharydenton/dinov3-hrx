@@ -28,18 +28,24 @@ pub(crate) fn load(path: &Path) -> Result<HashMap<String, Vec<u8>>> {
         let v: Vec<f32> = match t.dtype {
             DType::F32 => t
                 .bytes
-                .chunks_exact(4)
-                .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|x| f32::from_le_bytes(*x))
                 .collect(),
             DType::F16 => t
                 .bytes
-                .chunks_exact(2)
-                .map(|x| f16::from_le_bytes(x.try_into().unwrap()).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|x| f16::from_le_bytes(*x).to_f32())
                 .collect(),
             DType::BF16 => t
                 .bytes
-                .chunks_exact(2)
-                .map(|x| bf16::from_le_bytes(x.try_into().unwrap()).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|x| bf16::from_le_bytes(*x).to_f32())
                 .collect(),
             x => anyhow::bail!("unsupported dtype {x:?} for {name}"),
         };
@@ -154,8 +160,10 @@ mod tests {
             &[0., -0., 1., -1., 65504., -65504., 65519., -65519.],
         )?;
         let decoded: Vec<_> = bytes
-            .chunks_exact(2)
-            .map(|bytes| f16::from_le_bytes(bytes.try_into().unwrap()).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| f16::from_le_bytes(*bytes).to_f32())
             .collect();
         assert_eq!(
             decoded,

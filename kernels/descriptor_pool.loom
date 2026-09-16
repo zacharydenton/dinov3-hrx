@@ -1,0 +1,80 @@
+amdgpu.target<gfx11-generic> @dinov3_pool_target {subgroup_size = 32}
+kernel.def target(@dinov3_pool_target) export("dinov3_pool") @dinov3_pool(%rows: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %width = index.constant 384 : index
+  %count = index.mul %rows, %width : index
+  %extra = index.constant 255 : index
+  %rounded = index.add %count, %extra : index
+  %grid = index.div %rounded, %threads : index
+  kernel.launch.config workgroups(%grid, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%rows: index, %tokens: buffer, %masks: buffer, %output: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c5 = index.constant 5 : index
+  %c196 = index.constant 196 : index
+  %c201 = index.constant 201 : index
+  %c384 = index.constant 384 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %rows_bounded = index.assume %rows [range(%rows, 1, 128)] : index
+  %count = index.mul %rows_bounded, %c384 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %group, %c256 : index
+  %raw = index.add %base, %lane : index
+  %valid = index.cmp ult, %raw, %count : index
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  scf.if %valid {
+    %i = index.assume %raw [lt(%raw, %count)] : index
+    %row = index.div %i, %c384 : index
+    %channel = index.rem %i, %c384 : index
+
+    %batch = index.div %rows_bounded, %c2 : index
+    %nt = index.mul %batch, %c201 : index
+    %ne = index.mul %nt, %c384 : index
+    %nm = index.mul %batch, %c196 : index
+    %tg = buffer.assume.memory_space<global> %tokens : buffer
+    %mg = buffer.assume.memory_space<global> %masks : buffer
+    %og = buffer.assume.memory_space<global> %output : buffer
+    %tv = buffer.view %tg[%off] : buffer -> view<[%ne]xf32>
+    %mv = buffer.view %mg[%off] : buffer -> view<[%nm]xi8>
+    %ov = buffer.view %og[%off] : buffer -> view<[%count]xf32>
+    %image = index.div %row, %c2 : index
+    %which = index.rem %row, %c2 : index
+    %is_cls = index.cmp eq, %which, %c0 : index
+    %token_base = index.mul %image, %c201 : index
+    %mask_base = index.mul %image, %c196 : index
+      %offset = index.mul %token_base, %c384 : index
+      %at = index.add %offset, %channel : index
+      %safe = index.assume %at [lt(%at, %ne)] : index
+      %cls = view.load %tv[%safe] : view<[%ne]xf32> -> f32
+      %sum, %kept = scf.for %p = [%c0 to %c196 step %c1](%acc = %zero : f32, %n = %zero : f32) -> (f32, f32) {
+        %mi = index.add %mask_base, %p : index
+        %ms = index.assume %mi [lt(%mi, %nm)] : index
+        %mask = view.load %mv[%ms] : view<[%nm]xi8> -> i8
+        %mask32 = scalar.extui %mask : i8 to i32
+        %z32 = scalar.constant 0 : i32
+        %inside = scalar.cmpi ne, %mask32, %z32 : i32
+          %patch = index.add %p, %c5 : index
+          %token = index.add %token_base, %patch : index
+          %poffset = index.mul %token, %c384 : index
+          %pat = index.add %poffset, %channel : index
+          %psafe = index.assume %pat [lt(%pat, %ne)] : index
+          %v = view.load %tv[%psafe] : view<[%ne]xf32> -> f32
+          %selected = scf.select %inside, %v, %zero : f32
+          %increment = scf.select %inside, %one, %zero : f32
+          %next = scalar.addf %acc, %selected : f32
+          %nextn = scalar.addf %n, %increment : f32
+        scf.yield %next, %nextn : f32, f32
+      }
+      %nonempty = scalar.cmpf ogt, %kept, %zero : f32
+      %divisor = scf.select %nonempty, %kept, %one : f32
+      %mean = scalar.divf %sum, %divisor : f32
+    %value = scf.select %is_cls, %cls, %mean : f32
+    view.store %value, %ov[%i] : f32, view<[%count]xf32>
+  }
+  kernel.return
+}

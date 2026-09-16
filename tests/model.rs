@@ -62,7 +62,7 @@ fn rejects_overflowing_weights_before_gpu_initialization() -> Result<()> {
 #[ignore = "requires pretrained weights and gfx1151"]
 fn full_reference_and_changing_batch() -> Result<()> {
     let path = model_path()?;
-    let mut model = DINOv3::load(
+    let model = DINOv3::load(
         &path,
         Options {
             device: 0,
@@ -95,6 +95,78 @@ fn full_reference_and_changing_batch() -> Result<()> {
     assert_eq!(model.forward(&images)?, batched);
     assert!(model.forward(&[0.; 3]).is_err());
     assert!(model.forward(&vec![f32::NAN; IMAGE_ELEMENTS]).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires pretrained weights and gfx1151"]
+fn compact_rgb_descriptors_preserve_pooling_contract_and_transfer_only_descriptors() -> Result<()> {
+    let model = DINOv3::load(
+        model_path()?,
+        Options {
+            device: 0,
+            max_batch: 2,
+        },
+    )?;
+    let rgb = (0..2 * IMAGE_ELEMENTS)
+        .map(|i| ((i * 13 + i / 379) % 256) as u8)
+        .collect::<Vec<_>>();
+    let mut input = vec![0f32; rgb.len()];
+    for b in 0..2 {
+        for c in 0..3 {
+            for p in 0..224 * 224 {
+                input[b * IMAGE_ELEMENTS + c * 224 * 224 + p] =
+                    (rgb[b * IMAGE_ELEMENTS + p * 3 + c] as f32 / 255. - [0.485, 0.456, 0.406][c])
+                        / [0.229, 0.224, 0.225][c];
+            }
+        }
+    }
+    let masks = (0..392)
+        .map(|i| u8::from(i < 196 && i % 14 < 9))
+        .collect::<Vec<_>>();
+    let tokens = model.forward(&input)?;
+    let mut expected = Vec::new();
+    for b in 0..2 {
+        let mut cls = tokens[b * TOKENS * HIDDEN..b * TOKENS * HIDDEN + HIDDEN].to_vec();
+        let mut mean = vec![0f32; HIDDEN];
+        let mut kept = 0;
+        for p in 0..196 {
+            if masks[b * 196 + p] != 0 {
+                kept += 1;
+                for h in 0..HIDDEN {
+                    mean[h] += tokens[(b * TOKENS + 5 + p) * HIDDEN + h];
+                }
+            }
+        }
+        if kept > 0 {
+            for v in &mut mean {
+                *v /= kept as f32;
+            }
+        }
+        for row in [&mut cls, &mut mean] {
+            let sum = row.iter().map(|v| (*v as f64).powi(2)).sum::<f64>();
+            let norm = if sum > 0. { sum.sqrt() as f32 } else { 1. };
+            for v in row.iter_mut() {
+                *v /= norm;
+            }
+            expected.extend_from_slice(row);
+        }
+    }
+    let before = model.context().runtime().statistics().downloaded_bytes;
+    let actual = model.describe_rgb(&rgb, &masks)?;
+    let after = model.context().runtime().statistics().downloaded_bytes;
+    assert_eq!(after - before, (2 * 2 * HIDDEN * 4) as u64);
+    let max_error = actual
+        .iter()
+        .zip(&expected)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    eprintln!(
+        "compact descriptor maximum error: {max_error}; downloaded {} bytes",
+        after - before
+    );
+    assert!(max_error < 2e-4, "descriptor maximum error {max_error}");
+    assert_eq!(&actual[3 * HIDDEN..], &vec![0f32; HIDDEN]);
     Ok(())
 }
 
