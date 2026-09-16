@@ -39,9 +39,8 @@ kernel.def target(@dinov3_matmul_swiglu_wmma_gfx11) export("dinov3_matmul_swiglu
   %c64 = index.constant 64 : index
   %c256 = index.constant 256 : index
   %c0_offset = index.constant 0 : offset
-  %a_stage_bytes = index.constant 5120 : offset
-  %w_stage_bytes = index.constant 10240 : offset
-  %result_stage_bytes = index.constant 16384 : offset
+  %lds_bytes = index.constant 16384 : offset
+  %w_stage_offset = index.constant 5120 : offset
   %wave_result_bytes = index.constant 2048 : offset
   %up_result_bytes = index.constant 1024 : offset
   %m = index.constant 16 : index
@@ -75,19 +74,20 @@ kernel.def target(@dinov3_matmul_swiglu_wmma_gfx11) export("dinov3_matmul_swiglu
   %bias_view = buffer.view %bias_global[%c0_offset] : buffer -> view<[%gate_up_rows]xf32>
   %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_size]x[%n_size]xf16>
 
-  %a_stage = buffer.alloca<workgroup> align(16) %a_stage_bytes : buffer
-  %w_stage = buffer.alloca<workgroup> align(16) %w_stage_bytes : buffer
-  %result_stage = buffer.alloca<workgroup> align(16) %result_stage_bytes : buffer
-  %a_stage_view = buffer.view %a_stage[%c0_offset] : buffer -> view<64x40xf16>
-  %w_stage_view = buffer.view %w_stage[%c0_offset] : buffer -> view<128x40xf16>
+  // The final k-loop workgroup barrier retires the input and weight tiles.
+  // Their storage can then hold eight disjoint 2 KiB gate/up result tiles.
+  // This uses 16 KiB of LDS rather than retaining 31 KiB of disjoint stages.
+  %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
+  %a_stage_view = buffer.view %lds[%c0_offset] : buffer -> view<64x40xf16>
+  %w_stage_view = buffer.view %lds[%w_stage_offset] : buffer -> view<128x40xf16>
   // The rhs fragment wants logical [k][n]; the staged weight tile is physically
   // [n][k] with a 40-element row, so a strided layout reads it transposed.
   %w_fragment_layout = encoding.layout.strided [1, %c40] : encoding<layout>
-  %w_fragment_view = buffer.view %w_stage[%c0_offset] : buffer -> view<32x128xf16, %w_fragment_layout>
+  %w_fragment_view = buffer.view %lds[%w_stage_offset] : buffer -> view<32x128xf16, %w_fragment_layout>
   %wave_result_offset = index.scale %subgroup, %wave_result_bytes : index, offset -> offset
-  %result_view = buffer.view %result_stage[%wave_result_offset] : buffer -> view<16x16xf32>
+  %result_view = buffer.view %lds[%wave_result_offset] : buffer -> view<16x16xf32>
   %up_result_offset = index.add %wave_result_offset, %up_result_bytes : offset
-  %up_result_view = buffer.view %result_stage[%up_result_offset] : buffer -> view<16x16xf32>
+  %up_result_view = buffer.view %lds[%up_result_offset] : buffer -> view<16x16xf32>
 
   %load_packet = index.rem %workitem, %c8 : index
   %load_k = index.mul %load_packet, %c4 : index

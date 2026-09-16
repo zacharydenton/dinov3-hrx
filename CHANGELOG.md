@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Use HRX 0.7 graph composition and directly mapped input/output storage.
+- Pool CLS and patch-mean summaries on the GPU with compact readback, and fuse
+  RGB normalization with patch packing without changing output contracts.
+- Reuse SwiGLU staging memory for result tiles, reducing shared memory per
+  workgroup from 31 KiB to 16 KiB without changing arithmetic.
+
 - Use HRX 0.5's shared Hugging Face resolver, mapped SafeTensors loader,
   specialization builders, and top-level `hrx::model` API.
 - Fetch pinned pretrained weights through the shared Hugging Face cache by default; retain local-file and offline loading.

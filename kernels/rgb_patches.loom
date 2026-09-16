@@ -1,0 +1,76 @@
+// Normalize RGB directly into 16x16 patch rows, preserving division order.
+amdgpu.target<gfx11-generic> @rgb_patches_target {subgroup_size = 32}
+kernel.def target(@rgb_patches_target) export("rgb_patches") @rgb_patches(%unused: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %grid = index.constant @GRID@ : index
+  kernel.launch.config workgroups(%grid, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%unused: index, %input: buffer, %output: buffer) {
+  %zero = index.constant 0 : offset
+  %threads = index.constant 256 : index
+  %lane = kernel.workitem.id<x> : index
+  %group = kernel.workgroup.id<x> : index
+  %base = index.mul %group, %threads : index
+  %raw = index.add %base, %lane : index
+  %count = index.constant @COUNT@ : index
+  %p = index.constant 16 : index
+  %pp = index.constant 256 : index
+  %pe = index.constant 768 : index
+  %ch = index.constant 3 : index
+  %pxs = index.constant 14 : index
+  %cells = index.constant 196 : index
+  %h = index.constant 224 : index
+  %w = index.constant 224 : index
+  %inputg = buffer.assume.memory_space<global> %input : buffer
+  %outputg = buffer.assume.memory_space<global> %output : buffer
+  %src = buffer.view %inputg[%zero] : buffer -> view<@COUNT@xi8>
+  %dst = buffer.view %outputg[%zero] : buffer -> view<@COUNT@xf32>
+  %valid = index.cmp ult, %raw, %count : index
+  scf.if %valid {
+    %i = index.assume %raw [range(%raw, 0, @LAST@)] : index
+    %dx = index.rem %i, %p : index
+    %qdy = index.div %i, %p : index
+    %dy = index.rem %qdy, %p : index
+    %qc = index.div %i, %pp : index
+    %c = index.rem %qc, %ch : index
+    %cell = index.div %i, %pe : index
+    %image = index.div %cell, %cells : index
+    %incell = index.rem %cell, %cells : index
+    %px = index.rem %incell, %pxs : index
+    %py = index.div %incell, %pxs : index
+    %x0 = index.mul %px, %p : index
+    %x = index.add %x0, %dx : index
+    %y0 = index.mul %py, %p : index
+    %y = index.add %y0, %dy : index
+    %iy0 = index.mul %image, %h : index
+    %iy = index.add %iy0, %y : index
+    %ix0 = index.mul %iy, %w : index
+    %ix = index.add %ix0, %x : index
+    %ip = index.mul %ix, %ch : index
+    %ic = index.add %ip, %c : index
+    %j = index.assume %ic [range(%ic, 0, @LAST@)] : index
+    %byte = view.load %src[%j] : view<@COUNT@xi8> -> i8
+    %uint = scalar.extui %byte : i8 to i32
+    %raw_value = scalar.uitofp %uint : i32 to f32
+    %scale = scalar.constant 255.0 : f32
+    %unit = scalar.divf %raw_value, %scale : f32
+    %c0 = index.constant 0 : index
+    %c1 = index.constant 1 : index
+    %m0 = scalar.constant 0.485 : f32
+    %m1 = scalar.constant 0.456 : f32
+    %m2 = scalar.constant 0.406 : f32
+    %s0 = scalar.constant 0.229 : f32
+    %s1 = scalar.constant 0.224 : f32
+    %s2 = scalar.constant 0.225 : f32
+    %red = index.cmp eq, %c, %c0 : index
+    %green = index.cmp eq, %c, %c1 : index
+    %m12 = scf.select %green, %m1, %m2 : f32
+    %m = scf.select %red, %m0, %m12 : f32
+    %s12 = scf.select %green, %s1, %s2 : f32
+    %s = scf.select %red, %s0, %s12 : f32
+    %centered = scalar.subf %unit, %m : f32
+    %value = scalar.divf %centered, %s : f32
+    view.store %value, %dst[%i] : f32, view<@COUNT@xf32>
+  }
+  kernel.return
+}

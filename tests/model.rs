@@ -155,7 +155,7 @@ fn compact_rgb_descriptors_preserve_pooling_contract_and_transfer_only_descripto
     let before = model.context().runtime().statistics().downloaded_bytes;
     let actual = model.describe_rgb(&rgb, &masks)?;
     let after = model.context().runtime().statistics().downloaded_bytes;
-    assert_eq!(after - before, (2 * 2 * HIDDEN * 4) as u64);
+    assert_eq!(after - before, 0, "descriptor outputs are host-visible");
     let max_error = actual
         .iter()
         .zip(&expected)
@@ -167,6 +167,14 @@ fn compact_rgb_descriptors_preserve_pooling_contract_and_transfer_only_descripto
     );
     assert!(max_error < 2e-4, "descriptor maximum error {max_error}");
     assert_eq!(&actual[3 * HIDDEN..], &vec![0f32; HIDDEN]);
+    let before = model.context().runtime().statistics();
+    assert_eq!(model.describe_rgb(&rgb, &masks)?, actual);
+    let after = model.context().runtime().statistics();
+    assert_eq!(after.allocations, before.allocations);
+    assert_eq!(after.native_graphs_prepared, before.native_graphs_prepared);
+    assert_eq!(after.device_copied_bytes, before.device_copied_bytes);
+    assert_eq!(after.submissions - before.submissions, 1);
+    assert_eq!(after.uploaded_bytes, before.uploaded_bytes);
     Ok(())
 }
 
@@ -175,4 +183,59 @@ fn model_path() -> Result<std::path::PathBuf> {
         Some(path) => Ok(path.into()),
         None => dinov3_hrx::hub::weights(false),
     }
+}
+
+#[test]
+#[ignore = "requires pretrained weights and gfx1151"]
+fn raw_summaries_keep_values_and_download_only_requested_rows() -> Result<()> {
+    let model = DINOv3::load(
+        model_path()?,
+        Options {
+            device: 0,
+            max_batch: 2,
+        },
+    )?;
+    // Three different images also exercise the short final chunk.
+    let input = (0..3 * IMAGE_ELEMENTS)
+        .map(|i| ((i * 17 + i / 379) % 251) as f32 / 127. - 1.)
+        .collect::<Vec<_>>();
+    let tokens = model.forward(&input)?;
+    for mean in [false, true] {
+        let expected = tokens
+            .chunks(TOKENS * HIDDEN)
+            .flat_map(|image| {
+                if !mean {
+                    return image[..HIDDEN].to_vec();
+                }
+                let mut result = vec![0.; HIDDEN];
+                for patch in image[5 * HIDDEN..].chunks(HIDDEN) {
+                    for (sum, &v) in result.iter_mut().zip(patch) {
+                        *sum += v / 196.;
+                    }
+                }
+                result
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            let before = model.context().runtime().statistics().downloaded_bytes;
+            let actual = if mean {
+                model.patch_mean(&input)?
+            } else {
+                model.cls(&input)?
+            };
+            let after = model.context().runtime().statistics().downloaded_bytes;
+            assert!(
+                after - before <= (3 * HIDDEN * 4) as u64,
+                "only requested rows may be transferred"
+            );
+            assert_eq!(actual.as_flattened(), expected, "mean={mean}");
+        }
+    }
+    assert!(model.cls(&[])?.is_empty());
+    assert!(model.patch_mean(&[])?.is_empty());
+    assert!(model.cls(&input[..3]).is_err());
+    let mut invalid = input[..IMAGE_ELEMENTS].to_vec();
+    invalid[17] = f32::NAN;
+    assert!(model.patch_mean(&invalid).is_err());
+    Ok(())
 }

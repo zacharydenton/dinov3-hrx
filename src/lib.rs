@@ -2,13 +2,15 @@
 //! are 201 tokens of 384 float32 features per image, or compact normalized descriptors.
 pub mod hub;
 mod pooling;
+mod preprocess;
 mod weights;
 use anyhow::{Result, ensure};
 use hrx::{
+    execution::{Graph, MemoryPlacement},
     image::ImageOps,
-    inference::{Inference, ModelContext, PreparedModel},
+    inference::{Inference, InferenceGraph, ModelContext, PreparedModel},
     loom::Specialization,
-    model::{Command, Dispatch, KernelId, ModelDefinition, ModelSession, Region},
+    model::{Command, Dispatch, KernelId, ModelDefinition, ModelFragment, ModelSession, Region},
     plan_cache::PlanCache,
     tensor::{DType, DeviceTensor, Layout, TensorDesc},
 };
@@ -34,8 +36,9 @@ impl Default for Options {
 /// Shared resident model with bounded private slots for each cached shape.
 pub struct DINOv3 {
     engine: ModelDefinition,
-    plans: PlanCache<usize, PreparedModel>,
+    plans: PlanCache<(usize, bool, bool), PreparedModel>,
     pooling: PlanCache<usize, PreparedModel>,
+    summaries: PlanCache<(usize, bool), PreparedModel>,
     images: ImageOps,
     options: Options,
     weights: HashMap<String, Region>,
@@ -109,6 +112,7 @@ impl DINOv3 {
             engine,
             plans: PlanCache::new(8, PreparedModel::is_idle)?,
             pooling: PlanCache::new(8, PreparedModel::is_idle)?,
+            summaries: PlanCache::new(8, PreparedModel::is_idle)?,
             images: ImageOps::new(context, 8)?,
             options,
             weights,
@@ -135,9 +139,9 @@ impl DINOv3 {
                 && (1..=self.options.max_batch).contains(&shape[0]),
             "invalid token shape"
         );
-        let plan = self
-            .pooling
-            .get_or_prepare(shape[0], || pooling::prepare(self.context(), shape[0]))?;
+        let plan = self.pooling.get_or_prepare(shape[0], || {
+            pooling::fragment(self.context(), shape[0])?.prepare(3)
+        })?;
         Ok(plan.submit(&[tokens.clone(), mask.clone()])?)
     }
     /// Describe normalized host images, keeping full tokens on the device.
@@ -156,21 +160,9 @@ impl DINOv3 {
             .zip(output.chunks_mut(self.options.max_batch * 2 * HIDDEN))
         {
             let b = input.len() / IMAGE_ELEMENTS;
-            let patch_plan = self.images.prepare_patchify(
-                &TensorDesc::new(DType::F32, vec![b, 3, 224, 224])?.with_layout(Layout::Nchw)?,
-                16,
-            )?;
-            let patched = patch_plan
+            self.prepare_pipeline(b, false, true)?
                 .acquire_blocking()?
-                .submit_host(&[bytemuck::cast_slice(input)])?;
-            let tokens = self
-                .prepare(b)?
-                .acquire_blocking()?
-                .submit(patched.outputs())?;
-            let mask = self
-                .context()
-                .upload(TensorDesc::new(DType::U8, vec![b, 196])?, mask)?;
-            self.pool_descriptors(&tokens.outputs()[0], &mask)?
+                .submit_host(&[bytemuck::cast_slice(input), mask])?
                 .download()?
                 .read_into(&mut [bytemuck::cast_slice_mut(out)])?;
         }
@@ -192,17 +184,9 @@ impl DINOv3 {
             .zip(output.chunks_mut(self.options.max_batch * 2 * HIDDEN))
         {
             let b = input.len() / IMAGE_ELEMENTS;
-            let normalize = self.images.prepare_normalize_rgb(
-                &TensorDesc::new(DType::U8, vec![b, 224, 224, 3])?.with_layout(Layout::Nhwc)?,
-                [0.485, 0.456, 0.406],
-                [0.229, 0.224, 0.225],
-            )?;
-            let normalized = normalize.acquire_blocking()?.submit_host(&[input])?;
-            let tokens = self.submit(&normalized.outputs()[0])?;
-            let mask = self
-                .context()
-                .upload(TensorDesc::new(DType::U8, vec![b, 196])?, mask)?;
-            self.pool_descriptors(&tokens.outputs()[0], &mask)?
+            self.prepare_pipeline(b, true, true)?
+                .acquire_blocking()?
+                .submit_host(&[input, mask])?
                 .download()?
                 .read_into(&mut [bytemuck::cast_slice_mut(out)])?;
         }
@@ -221,9 +205,9 @@ impl DINOv3 {
                 && desc.shape()[1..] == [3, 224, 224],
             "expected normalized NCHW f32 input"
         );
-        let plan = self.prepare(desc.shape()[0])?;
-        let patched = self.images.patchify(pixels, 16)?;
-        Ok(plan.submit(patched.outputs())?)
+        Ok(self
+            .prepare_pipeline(desc.shape()[0], false, false)?
+            .submit(std::slice::from_ref(pixels))?)
     }
     /// Infer an arbitrary batch of normalized NCHW RGB images.
     pub fn forward(&self, pixels: &[f32]) -> Result<Vec<f32>> {
@@ -239,16 +223,9 @@ impl DINOv3 {
             .zip(output.chunks_mut(self.options.max_batch * TOKENS * HIDDEN))
         {
             let b = input.len() / IMAGE_ELEMENTS;
-            let patch_plan = self.images.prepare_patchify(
-                &TensorDesc::new(DType::F32, vec![b, 3, 224, 224])?.with_layout(Layout::Nchw)?,
-                16,
-            )?;
-            let patched = patch_plan
+            self.prepare_pipeline(b, false, false)?
                 .acquire_blocking()?
-                .submit_host(&[bytemuck::cast_slice(input)])?;
-            self.prepare(b)?
-                .acquire_blocking()?
-                .submit(patched.outputs())?
+                .submit_host(&[bytemuck::cast_slice(input)])?
                 .download()?
                 .read_into(&mut [bytemuck::cast_slice_mut(output)])?;
         }
@@ -278,210 +255,333 @@ impl DINOv3 {
     }
     /// Run inference and return the CLS token from each image.
     pub fn cls(&self, pixels: &[f32]) -> Result<Vec<[f32; HIDDEN]>> {
-        Ok(self
-            .forward(pixels)?
-            .chunks(TOKENS * HIDDEN)
-            .map(|x| x[..HIDDEN].try_into().unwrap())
-            .collect())
+        self.raw_summary(pixels, false)
     }
     /// Run inference and average the 196 patch tokens for each image.
     pub fn patch_mean(&self, pixels: &[f32]) -> Result<Vec<[f32; HIDDEN]>> {
-        Ok(self
-            .forward(pixels)?
-            .chunks(TOKENS * HIDDEN)
-            .map(|x| {
-                let mut out = [0.; HIDDEN];
-                for row in x[5 * HIDDEN..].chunks(HIDDEN) {
-                    for (a, b) in out.iter_mut().zip(row) {
-                        *a += b / 196.;
-                    }
-                }
-                out
-            })
-            .collect())
+        self.raw_summary(pixels, true)
     }
-    fn prepare(&self, b: usize) -> Result<std::sync::Arc<PreparedModel>> {
+    fn raw_summary(&self, pixels: &[f32], mean: bool) -> Result<Vec<[f32; HIDDEN]>> {
+        ensure!(
+            pixels.len().is_multiple_of(IMAGE_ELEMENTS),
+            "input must contain complete 3×224×224 images"
+        );
+        ensure!(pixels.iter().all(|x| x.is_finite()), "input must be finite");
+        let mut output = vec![[0.; HIDDEN]; pixels.len() / IMAGE_ELEMENTS];
+        for (input, output) in pixels
+            .chunks(self.options.max_batch * IMAGE_ELEMENTS)
+            .zip(output.chunks_mut(self.options.max_batch))
+        {
+            let batch = output.len();
+            let plan = self.summaries.get_or_prepare((batch, mean), || {
+                PreparedModel::prepare(self.context(), 3, |context| {
+                    let input = context.allocate_with(
+                        TensorDesc::new(DType::F32, vec![batch, 3, 224, 224])?
+                            .with_layout(Layout::Nchw)?,
+                        MemoryPlacement::HostVisible,
+                    )?;
+                    let mut graph = context.runtime().graph();
+                    let tokens = self
+                        .record(&mut graph, &input)
+                        .map_err(|e| hrx::Error::Message(e.to_string()))?;
+                    let output = pooling::raw_fragment(context, batch, mean)?
+                        .record(&mut graph, &[tokens])?;
+                    Ok(InferenceGraph {
+                        inputs: vec![input],
+                        outputs: output,
+                        graph: graph.prepare()?,
+                    })
+                })
+            })?;
+            plan.acquire_blocking()?
+                .submit_host(&[bytemuck::cast_slice(input)])?
+                .download()?
+                .read_into(&mut [bytemuck::cast_slice_mut(output.as_flattened_mut())])?;
+        }
+        Ok(output)
+    }
+    /// Record normalized NCHW F32 pixels through patchification and transformer
+    /// inference into a caller-owned graph. The returned token tensor is valid
+    /// after that graph executes; no private inference pool or copies are used.
+    pub fn record(&self, graph: &mut Graph, pixels: &DeviceTensor) -> Result<DeviceTensor> {
+        self.context().validate(pixels)?;
+        let desc = pixels.desc();
+        ensure!(
+            desc.dtype() == DType::F32
+                && desc.layout() == Layout::Nchw
+                && desc.is_contiguous()
+                && desc.shape().len() == 4
+                && desc.shape()[1..] == [3, 224, 224],
+            "expected normalized NCHW f32 input"
+        );
+        let model = self.fragment(desc.shape()[0])?;
+        let patches = self
+            .images
+            .patchify_fragment(desc, 16)?
+            .record(graph, std::slice::from_ref(pixels))?;
+        Ok(model.record(graph, &patches)?.remove(0))
+    }
+
+    /// Record normalization (for U8 NHWC RGB), patchification, transformer and
+    /// masked descriptor pooling in one graph. F32 NCHW inputs are already
+    /// normalized. Only the final `[batch,2,384]` descriptors need be downloaded.
+    pub fn record_descriptors(
+        &self,
+        graph: &mut Graph,
+        pixels: &DeviceTensor,
+        masks: &DeviceTensor,
+    ) -> Result<DeviceTensor> {
+        self.context().validate(pixels)?;
+        self.context().validate(masks)?;
+        let batch = pixels.desc().shape().first().copied().unwrap_or(0);
+        ensure!(
+            masks.desc() == &TensorDesc::new(DType::U8, vec![batch, 196])?,
+            "invalid descriptor masks"
+        );
+        let tokens = if pixels.desc().dtype() == DType::U8 {
+            ensure!(
+                pixels.desc()
+                    == &TensorDesc::new(DType::U8, vec![batch, 224, 224, 3])?
+                        .with_layout(Layout::Nhwc)?,
+                "expected contiguous 224x224 RGB input"
+            );
+            let patches = preprocess::fragment(self.context(), batch)?
+                .record(graph, std::slice::from_ref(pixels))?;
+            self.fragment(batch)?.record(graph, &patches)?.remove(0)
+        } else {
+            self.record(graph, pixels)?
+        };
+        Ok(pooling::fragment(self.context(), batch)?
+            .record(graph, &[tokens, masks.clone()])?
+            .remove(0))
+    }
+
+    fn prepare_pipeline(
+        &self,
+        batch: usize,
+        rgb: bool,
+        descriptors: bool,
+    ) -> Result<std::sync::Arc<PreparedModel>> {
+        ensure!(
+            (1..=self.options.max_batch).contains(&batch),
+            "invalid batch size"
+        );
+        Ok(self.plans.get_or_prepare((batch, rgb, descriptors), || {
+            PreparedModel::prepare(self.context(), 3, |context| {
+                let pixels = context.allocate_with(
+                    if rgb {
+                        TensorDesc::new(DType::U8, vec![batch, 224, 224, 3])?
+                            .with_layout(Layout::Nhwc)?
+                    } else {
+                        TensorDesc::new(DType::F32, vec![batch, 3, 224, 224])?
+                            .with_layout(Layout::Nchw)?
+                    },
+                    MemoryPlacement::HostVisible,
+                )?;
+                let mut graph = context.runtime().graph();
+                let (inputs, output) = if descriptors {
+                    let mask = context.allocate_with(
+                        TensorDesc::new(DType::U8, vec![batch, 196])?,
+                        MemoryPlacement::HostVisible,
+                    )?;
+                    let output = self
+                        .record_descriptors(&mut graph, &pixels, &mask)
+                        .map_err(|error| hrx::Error::Message(error.to_string()))?;
+                    (vec![pixels, mask], output)
+                } else {
+                    let output = self
+                        .record(&mut graph, &pixels)
+                        .map_err(|error| hrx::Error::Message(error.to_string()))?;
+                    (vec![pixels], output)
+                };
+                Ok(InferenceGraph {
+                    inputs,
+                    outputs: vec![output],
+                    graph: graph.prepare()?,
+                })
+            })
+        })?)
+    }
+
+    fn fragment(&self, b: usize) -> Result<ModelFragment> {
         ensure!(
             (1..=self.options.max_batch).contains(&b),
             "invalid batch size"
         );
-        Ok(self.plans.get_or_prepare(b, || {
-            let r = (b * 201) as u32;
-            let p = (b * 196) as u32;
-            let sizes = [
-                b * 201 * 384 * 2,
-                b * 201 * 384 * 2,
-                (b * 201 + 16) * 1152 * 2,
-                b * 201 * 384 * 2,
-                b * 201 * 1536 * 2,
-                b * 201 * 384 * 4,
-                b * 196 * 384 * 4,
-                b * 196 * 768 * 4,
-                4 * 201 * 384 * 4,
-            ];
-            let shaped = self
-                .a
-                .iter()
-                .zip(sizes)
-                .map(|(&region, bytes)| region.slice(0, bytes))
-                .collect::<hrx::Result<Vec<_>>>()?;
-            let [x, h, q, attn, act, out, patched, image, partials]: [Region; 9] =
-                shaped.try_into().unwrap();
-            let w = |s: &str| self.weights[s];
-            let mut commands = vec![Command::Fill {
-                region: q.slice(r as usize * 1152 * 2, 16 * 1152 * 2)?,
-                value: 0,
-            }];
-            let mut add = |kernel: usize,
-                           scalar: u32,
-                           grid: [u32; 3],
-                           bindings: Vec<Region>,
-                           output: Region,
-                           reads_output: bool| {
-                let bindings = bindings
-                    .into_iter()
-                    .map(|region| {
-                        if region == output {
-                            if reads_output {
-                                region.read_write()
-                            } else {
-                                region.write()
-                            }
+        let r = (b * 201) as u32;
+        let p = (b * 196) as u32;
+        let sizes = [
+            b * 201 * 384 * 2,
+            b * 201 * 384 * 2,
+            (b * 201 + 16) * 1152 * 2,
+            b * 201 * 384 * 2,
+            b * 201 * 1536 * 2,
+            b * 201 * 384 * 4,
+            b * 196 * 384 * 4,
+            b * 196 * 768 * 4,
+            4 * 201 * 384 * 4,
+        ];
+        let shaped = self
+            .a
+            .iter()
+            .zip(sizes)
+            .map(|(&region, bytes)| region.slice(0, bytes))
+            .collect::<hrx::Result<Vec<_>>>()?;
+        let [x, h, q, attn, act, out, patched, image, partials]: [Region; 9] =
+            shaped.try_into().unwrap();
+        let w = |s: &str| self.weights[s];
+        let mut commands = vec![Command::Fill {
+            region: q.slice(r as usize * 1152 * 2, 16 * 1152 * 2)?,
+            value: 0,
+        }];
+        let mut add = |kernel: usize,
+                       scalar: u32,
+                       grid: [u32; 3],
+                       bindings: Vec<Region>,
+                       output: Region,
+                       reads_output: bool| {
+            let bindings = bindings
+                .into_iter()
+                .map(|region| {
+                    if region == output {
+                        if reads_output {
+                            region.read_write()
                         } else {
-                            region.read()
+                            region.write()
                         }
-                    })
-                    .collect();
-                commands.push(Command::Dispatch(Dispatch::indices(
-                    self.kernels[kernel],
-                    [scalar],
-                    grid,
-                    bindings,
-                )));
-            };
+                    } else {
+                        region.read()
+                    }
+                })
+                .collect();
+            commands.push(Command::Dispatch(Dispatch::indices(
+                self.kernels[kernel],
+                [scalar],
+                grid,
+                bindings,
+            )));
+        };
+        add(
+            0,
+            p,
+            [6, p.div_ceil(64), 1],
+            vec![image, w("patch_w"), w("patch_b"), patched],
+            patched,
+            false,
+        );
+        add(1, r, [r, 1, 1], vec![patched, w("prefix"), x], x, false);
+        add(
+            2,
+            r,
+            [r.div_ceil(8), 1, 1],
+            vec![x, w("l0_norm1_w"), w("l0_norm1_b"), h],
+            h,
+            false,
+        );
+        for i in 0..12 {
+            let s = format!("l{i}_");
+            let wt = |suffix: &str| w(&(s.clone() + suffix));
             add(
-                0,
-                p,
-                [6, p.div_ceil(64), 1],
-                vec![image, w("patch_w"), w("patch_b"), patched],
-                patched,
+                4,
+                r,
+                [18, r.div_ceil(64), 1],
+                vec![h, wt("qkv_w"), wt("qkv_b"), q, w("rope_cos"), w("rope_sin")],
+                q,
                 false,
             );
-            add(1, r, [r, 1, 1], vec![patched, w("prefix"), x], x, false);
+            let k = q.slice(768, q.len() - 768)?;
+            let v = q.slice(1536, q.len() - 1536)?;
+            add(
+                5,
+                r,
+                [(b * 13) as u32, 6, 1],
+                vec![q, k, v, attn],
+                attn,
+                false,
+            );
+            add(
+                6,
+                r,
+                [6, r.div_ceil(64), 1],
+                vec![attn, wt("o_w"), wt("o_b"), x, wt("ls1")],
+                x,
+                true,
+            );
             add(
                 2,
                 r,
                 [r.div_ceil(8), 1, 1],
-                vec![x, w("l0_norm1_w"), w("l0_norm1_b"), h],
+                vec![x, wt("norm2_w"), wt("norm2_b"), h],
                 h,
                 false,
             );
-            for i in 0..12 {
-                let s = format!("l{i}_");
-                let wt = |suffix: &str| w(&(s.clone() + suffix));
+            add(
+                8,
+                r,
+                [24, r.div_ceil(64), 1],
+                vec![h, wt("gateup_w"), wt("gateup_b"), act],
+                act,
+                false,
+            );
+            if b == 1 {
                 add(
-                    4,
+                    9,
                     r,
-                    [18, r.div_ceil(64), 1],
-                    vec![h, wt("qkv_w"), wt("qkv_b"), q, w("rope_cos"), w("rope_sin")],
-                    q,
-                    false,
-                );
-                let k = q.slice(768, q.len() - 768)?;
-                let v = q.slice(1536, q.len() - 1536)?;
-                add(
-                    5,
-                    r,
-                    [(b * 13) as u32, 6, 1],
-                    vec![q, k, v, attn],
-                    attn,
+                    [6, r.div_ceil(64), 4],
+                    vec![act, wt("down_w"), wt("down_b"), partials],
+                    partials,
                     false,
                 );
                 add(
-                    6,
+                    10,
                     r,
-                    [6, r.div_ceil(64), 1],
-                    vec![attn, wt("o_w"), wt("o_b"), x, wt("ls1")],
+                    [r, 1, 1],
+                    vec![partials, wt("down_b"), x, wt("ls2")],
                     x,
                     true,
                 );
+            } else {
+                add(
+                    7,
+                    r,
+                    [6, r.div_ceil(64), 1],
+                    vec![act, wt("down_w"), wt("down_b"), x, wt("ls2")],
+                    x,
+                    true,
+                );
+            }
+            if i < 11 {
                 add(
                     2,
                     r,
                     [r.div_ceil(8), 1, 1],
-                    vec![x, wt("norm2_w"), wt("norm2_b"), h],
+                    vec![
+                        x,
+                        w(&format!("l{}_norm1_w", i + 1)),
+                        w(&format!("l{}_norm1_b", i + 1)),
+                        h,
+                    ],
                     h,
                     false,
                 );
-                add(
-                    8,
-                    r,
-                    [24, r.div_ceil(64), 1],
-                    vec![h, wt("gateup_w"), wt("gateup_b"), act],
-                    act,
-                    false,
-                );
-                if b == 1 {
-                    add(
-                        9,
-                        r,
-                        [6, r.div_ceil(64), 4],
-                        vec![act, wt("down_w"), wt("down_b"), partials],
-                        partials,
-                        false,
-                    );
-                    add(
-                        10,
-                        r,
-                        [r, 1, 1],
-                        vec![partials, wt("down_b"), x, wt("ls2")],
-                        x,
-                        true,
-                    );
-                } else {
-                    add(
-                        7,
-                        r,
-                        [6, r.div_ceil(64), 1],
-                        vec![act, wt("down_w"), wt("down_b"), x, wt("ls2")],
-                        x,
-                        true,
-                    );
-                }
-                if i < 11 {
-                    add(
-                        2,
-                        r,
-                        [r.div_ceil(8), 1, 1],
-                        vec![
-                            x,
-                            w(&format!("l{}_norm1_w", i + 1)),
-                            w(&format!("l{}_norm1_b", i + 1)),
-                            h,
-                        ],
-                        h,
-                        false,
-                    );
-                }
             }
-            add(
-                3,
-                r,
-                [r.div_ceil(8), 1, 1],
-                vec![x, w("norm_w"), w("norm_b"), out],
-                out,
-                false,
-            );
-            // The embedded kernels obey the scalar, region and access contracts above.
-            unsafe {
-                self.engine.prepare(
-                    &commands,
-                    &[(image, TensorDesc::new(DType::F32, vec![b, 196, 768])?)],
-                    &[(out, TensorDesc::new(DType::F32, vec![b, TOKENS, HIDDEN])?)],
-                    3,
-                )
-            }
-        })?)
+        }
+        add(
+            3,
+            r,
+            [r.div_ceil(8), 1, 1],
+            vec![x, w("norm_w"), w("norm_b"), out],
+            out,
+            false,
+        );
+        // The embedded kernels obey the scalar, region and access contracts above.
+        unsafe {
+            Ok(self.engine.fragment(
+                &commands,
+                &[(image, TensorDesc::new(DType::F32, vec![b, 196, 768])?)],
+                &[(out, TensorDesc::new(DType::F32, vec![b, TOKENS, HIDDEN])?)],
+            )?)
+        }
     }
 }
 #[cfg(test)]

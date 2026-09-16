@@ -1,0 +1,57 @@
+// Preserve the public, unnormalized CLS/patch_mean contracts. Mean uses
+// divide-then-add in patch order, matching the former host implementation.
+amdgpu.target<gfx11-generic> @raw_pool_target {subgroup_size = 32}
+kernel.def target(@raw_pool_target) export("raw_pool") @raw_pool(%unused:index) {
+ %one=index.constant 1 : index
+ %threads=index.constant 256 : index
+ %grid=index.constant @GRID@ : index
+ kernel.launch.config workgroups(%grid,%one,%one) workgroup_size(%threads,%one,%one) : index
+} launch(%unused:index,%input:buffer,%output:buffer) {
+ %off=index.constant 0 : offset
+ %zero=index.constant 0 : index
+ %one=index.constant 1 : index
+ %five=index.constant 5 : index
+ %patches=index.constant 196 : index
+ %tokens=index.constant 201 : index
+ %width=index.constant 384 : index
+ %threads=index.constant 256 : index
+ %count=index.constant @COUNT@ : index
+ %group=kernel.workgroup.id<x> : index
+ %lane=kernel.workitem.id<x> : index
+ %base=index.mul %group,%threads : index
+ %raw=index.add %base,%lane : index
+ %valid=index.cmp ult,%raw,%count : index
+ scf.if %valid {
+  %i=index.assume %raw [range(%raw,0,@LAST@)] : index
+  %image=index.div %i,%width : index
+  %channel=index.rem %i,%width : index
+  %token_base=index.mul %image,%tokens : index
+  %iv=buffer.view %input[%off] : buffer -> view<@INPUT@xf32>
+  %ov=buffer.view %output[%off] : buffer -> view<@COUNT@xf32>
+  %mean=scalar.constant @MEAN@ : i1
+  %value=scf.if %mean -> (f32) {
+   %z=scalar.constant 0.0 : f32
+   %divisor=scalar.constant 196.0 : f32
+   %sum=scf.for %p=[%zero to %patches step %one](%acc=%z : f32) -> (f32) {
+    %p5=index.add %p,%five : index
+    %token=index.add %token_base,%p5 : index
+    %row=index.mul %token,%width : index
+    %at0=index.add %row,%channel : index
+    %at=index.assume %at0 [range(%at0,0,@INPUT_LAST@)] : index
+    %v=view.load %iv[%at] : view<@INPUT@xf32> -> f32
+    %scaled=scalar.divf %v,%divisor : f32
+    %next=scalar.addf %acc,%scaled : f32
+    scf.yield %next : f32
+   }
+   scf.yield %sum : f32
+  } else {
+   %row=index.mul %token_base,%width : index
+   %at0=index.add %row,%channel : index
+   %at=index.assume %at0 [range(%at0,0,@INPUT_LAST@)] : index
+   %cls=view.load %iv[%at] : view<@INPUT@xf32> -> f32
+   scf.yield %cls : f32
+  }
+  view.store %value,%ov[%i] : f32,view<@COUNT@xf32>
+ }
+ kernel.return
+}
