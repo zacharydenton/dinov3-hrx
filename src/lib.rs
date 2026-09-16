@@ -3,13 +3,13 @@
 pub mod hub;
 mod weights;
 use anyhow::{Result, ensure};
-use hrx::loom::{
-    Specialization,
+use hrx::{
+    loom::Specialization,
     model::{Command, Dispatch, KernelId, ModelSession, Region},
 };
 use std::{collections::HashMap, path::Path};
 
-pub use hrx::loom::model::{Distribution, ForwardTimings};
+pub use hrx::{benchmark::Distribution, model::ForwardTimings};
 
 pub const IMAGE_ELEMENTS: usize = 3 * 224 * 224;
 pub const TOKENS: usize = 201;
@@ -331,7 +331,7 @@ fn specifications() -> Vec<(&'static str, Specialization)> {
     let mut s = vec![];
     macro_rules! spec { ($file:literal,$ns:literal,[$($k:literal => $v:expr),*]) => {{
         let mut spec=Specialization::new(concat!("dinov3_",$ns));
-        $(spec.config.insert(concat!("dinov3.",$ns,".",$k).into(),$v.to_string());)*
+        $(spec.set_config(concat!("dinov3.",$ns,".",$k),$v.to_string());)*
         s.push((include_str!(concat!("../kernels/",$file,".loom")),spec));
     }}; }
     spec!("matmul_bias_f16_wmma","matmul_bias_f16_wmma",["k_size"=>768,"n_size"=>384]);

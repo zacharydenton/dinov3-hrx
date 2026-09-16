@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Use HRX 0.5's shared Hugging Face resolver, mapped SafeTensors loader,
+  specialization builders, and top-level `hrx::model` API.
 - Fetch pinned pretrained weights through the shared Hugging Face cache by default; retain local-file and offline loading.
 - Require Rust 1.91 for the HF Hub 1.0 dependency stack.
 

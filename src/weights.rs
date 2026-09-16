@@ -1,6 +1,6 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use half::{bf16, f16};
-use safetensors::{Dtype, SafeTensors};
+use hrx::artifacts::safetensors::{DType, FileView};
 use std::{collections::HashMap, path::Path};
 
 fn pack_f16(name: &str, values: &[f32]) -> Result<Vec<u8>> {
@@ -17,30 +17,27 @@ fn pack_f16(name: &str, values: &[f32]) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn load(path: &Path) -> Result<HashMap<String, Vec<u8>>> {
-    let file = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let tensors = SafeTensors::deserialize(&file)?;
+    let tensors = FileView::read(path)?;
     let get = |name: &str, shape: &[usize]| -> Result<Vec<f32>> {
-        let t = tensors
-            .tensor(name)
-            .with_context(|| format!("missing tensor {name}"))?;
+        let t = tensors.get(name)?;
         ensure!(
-            t.shape() == shape,
+            t.shape == shape,
             "{name}: expected {shape:?}, found {:?}",
-            t.shape()
+            t.shape
         );
-        let v: Vec<f32> = match t.dtype() {
-            Dtype::F32 => t
-                .data()
+        let v: Vec<f32> = match t.dtype {
+            DType::F32 => t
+                .bytes
                 .chunks_exact(4)
                 .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
                 .collect(),
-            Dtype::F16 => t
-                .data()
+            DType::F16 => t
+                .bytes
                 .chunks_exact(2)
                 .map(|x| f16::from_le_bytes(x.try_into().unwrap()).to_f32())
                 .collect(),
-            Dtype::BF16 => t
-                .data()
+            DType::BF16 => t
+                .bytes
                 .chunks_exact(2)
                 .map(|x| bf16::from_le_bytes(x.try_into().unwrap()).to_f32())
                 .collect(),
