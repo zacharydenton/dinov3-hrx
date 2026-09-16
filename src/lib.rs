@@ -1,12 +1,15 @@
 //! DINOv3 ViT-S+/16 at 224×224. Inputs are normalized RGB NCHW; outputs
 //! are 201 tokens of 384 float32 features per image. A model owns a GPU stream.
-mod engine;
 pub mod hub;
 mod weights;
 use anyhow::{Result, ensure};
-use engine::{Engine, Launch, Region};
-use hrx::loom::Specialization;
+use hrx::loom::{
+    Specialization,
+    model::{Command, Dispatch, KernelId, ModelSession, Region},
+};
 use std::{collections::HashMap, path::Path};
+
+pub use hrx::loom::model::{Distribution, ForwardTimings};
 
 pub const IMAGE_ELEMENTS: usize = 3 * 224 * 224;
 pub const TOKENS: usize = 201;
@@ -27,10 +30,11 @@ impl Default for Options {
 }
 /// Resident model. Inference requires exclusive access; separate models can run independently.
 pub struct DINOv3 {
-    engine: Engine,
+    engine: ModelSession,
     options: Options,
     weights: HashMap<String, Region>,
     a: Vec<Region>,
+    kernels: Vec<KernelId>,
     patched: Vec<f32>,
 }
 impl DINOv3 {
@@ -52,7 +56,7 @@ impl DINOv3 {
             "max_batch must be 1..=64"
         );
         let packed = weights::load(path.as_ref())?;
-        let mut engine = Engine::new(options.device)?;
+        let mut engine = ModelSession::open_for(options.device, "gfx1151")?;
         let mut weights = HashMap::new();
         for (name, bytes) in packed {
             weights.insert(name, engine.weight(&bytes)?);
@@ -75,14 +79,16 @@ impl DINOv3 {
         let a = sizes
             .into_iter()
             .map(|n| engine.allocate(n))
-            .collect::<Result<_>>()?;
-        engine.compile(&specifications())?;
+            .collect::<std::result::Result<_, _>>()?;
+        // Every source is embedded in this crate and its bindings are declared below.
+        let kernels = unsafe { engine.compile(&specifications())? };
         engine.reserve_readback(options.max_batch * TOKENS * HIDDEN * 4)?;
         Ok(Self {
             engine,
             options,
             weights,
             a,
+            kernels,
             patched: vec![0.; options.max_batch * IMAGE_ELEMENTS],
         })
     }
@@ -119,8 +125,9 @@ impl DINOv3 {
             "benchmark requires one nonempty batch"
         );
         self.forward(pixels)?;
-        self.engine
-            .benchmark(pixels.len() / IMAGE_ELEMENTS, samples)
+        Ok(self
+            .engine
+            .benchmark(pixels.len() / IMAGE_ELEMENTS, samples)?)
     }
     /// Run inference and return the CLS token from each image.
     pub fn cls(&mut self, pixels: &[f32]) -> Result<Vec<[f32; HIDDEN]>> {
@@ -147,7 +154,7 @@ impl DINOv3 {
             .collect())
     }
     fn prepare(&mut self, b: usize) -> Result<()> {
-        if self.engine.graphs.contains_key(&b) {
+        if self.engine.is_recorded(b) {
             return Ok(());
         }
         let r = (b * 201) as u32;
@@ -155,27 +162,53 @@ impl DINOv3 {
         let [x, h, q, attn, act, out, patched, image, partials]: [Region; 9] =
             self.a.clone().try_into().unwrap();
         let w = |s: &str| self.weights[s];
-        let mut l = vec![];
-        let mut add = |kernel, scalar, grid, bindings| {
-            l.push(Launch {
-                kernel,
-                scalar,
+        let mut commands = vec![Command::Fill {
+            region: q.slice(r as usize * 1152 * 2, 16 * 1152 * 2)?,
+            value: 0,
+        }];
+        let mut add = |kernel: usize,
+                       scalar: u32,
+                       grid: [u32; 3],
+                       bindings: Vec<Region>,
+                       output: Region,
+                       reads_output: bool| {
+            let bindings = bindings
+                .into_iter()
+                .map(|region| {
+                    if region == output {
+                        if reads_output {
+                            region.read_write()
+                        } else {
+                            region.write()
+                        }
+                    } else {
+                        region.read()
+                    }
+                })
+                .collect();
+            commands.push(Command::Dispatch(Dispatch::indices(
+                self.kernels[kernel],
+                [scalar],
                 grid,
                 bindings,
-            })
+            )));
         };
         add(
             0,
             p,
             [6, p.div_ceil(64), 1],
             vec![image, w("patch_w"), w("patch_b"), patched],
+            patched,
+            false,
         );
-        add(1, r, [r, 1, 1], vec![patched, w("prefix"), x]);
+        add(1, r, [r, 1, 1], vec![patched, w("prefix"), x], x, false);
         add(
             2,
             r,
             [r.div_ceil(8), 1, 1],
             vec![x, w("l0_norm1_w"), w("l0_norm1_b"), h],
+            h,
+            false,
         );
         for i in 0..12 {
             let s = format!("l{i}_");
@@ -185,35 +218,42 @@ impl DINOv3 {
                 r,
                 [18, r.div_ceil(64), 1],
                 vec![h, wt("qkv_w"), wt("qkv_b"), q, w("rope_cos"), w("rope_sin")],
+                q,
+                false,
             );
-            let k = Region {
-                offset: 768,
-                bytes: q.bytes - 768,
-                ..q
-            };
-            let v = Region {
-                offset: 1536,
-                bytes: q.bytes - 1536,
-                ..q
-            };
-            add(5, r, [(b * 13) as u32, 6, 1], vec![q, k, v, attn]);
+            let k = q.slice(768, q.len() - 768)?;
+            let v = q.slice(1536, q.len() - 1536)?;
+            add(
+                5,
+                r,
+                [(b * 13) as u32, 6, 1],
+                vec![q, k, v, attn],
+                attn,
+                false,
+            );
             add(
                 6,
                 r,
                 [6, r.div_ceil(64), 1],
                 vec![attn, wt("o_w"), wt("o_b"), x, wt("ls1")],
+                x,
+                true,
             );
             add(
                 2,
                 r,
                 [r.div_ceil(8), 1, 1],
                 vec![x, wt("norm2_w"), wt("norm2_b"), h],
+                h,
+                false,
             );
             add(
                 8,
                 r,
                 [24, r.div_ceil(64), 1],
                 vec![h, wt("gateup_w"), wt("gateup_b"), act],
+                act,
+                false,
             );
             if b == 1 {
                 add(
@@ -221,14 +261,25 @@ impl DINOv3 {
                     r,
                     [6, r.div_ceil(64), 4],
                     vec![act, wt("down_w"), wt("down_b"), partials],
+                    partials,
+                    false,
                 );
-                add(10, r, [r, 1, 1], vec![partials, wt("down_b"), x, wt("ls2")]);
+                add(
+                    10,
+                    r,
+                    [r, 1, 1],
+                    vec![partials, wt("down_b"), x, wt("ls2")],
+                    x,
+                    true,
+                );
             } else {
                 add(
                     7,
                     r,
                     [6, r.div_ceil(64), 1],
                     vec![act, wt("down_w"), wt("down_b"), x, wt("ls2")],
+                    x,
+                    true,
                 );
             }
             if i < 11 {
@@ -242,6 +293,8 @@ impl DINOv3 {
                         w(&format!("l{}_norm1_b", i + 1)),
                         h,
                     ],
+                    h,
+                    false,
                 );
             }
         }
@@ -250,16 +303,12 @@ impl DINOv3 {
             r,
             [r.div_ceil(8), 1, 1],
             vec![x, w("norm_w"), w("norm_b"), out],
+            out,
+            false,
         );
-        self.engine.record(
-            b,
-            &l,
-            Some(Region {
-                offset: r as usize * 1152 * 2,
-                bytes: 16 * 1152 * 2,
-                ..q
-            }),
-        )
+        // The embedded kernels obey the scalar, region and access contracts above.
+        unsafe { self.engine.record(b, &commands)? };
+        Ok(())
     }
 }
 fn patchify(input: &[f32], out: &mut [f32]) {
@@ -298,8 +347,6 @@ fn specifications() -> Vec<(&'static str, Specialization)> {
     spec!("splitk_reduce_f16","splitk_reduce_f16",["n_size"=>384,"splits"=>4]);
     s
 }
-
-pub use engine::{Distribution, ForwardTimings};
 
 #[cfg(test)]
 mod tests {
