@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Widen matrix staging packets and double reduction tiles while preserving
+  accumulation order; cover batch tails and allocation-free replay through 64.
 - Use HRX 0.7 graph composition and directly mapped input/output storage.
 - Pool CLS and patch-mean summaries on the GPU with compact readback, and fuse
   RGB normalization with patch packing without changing output contracts.

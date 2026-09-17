@@ -1,3 +1,5 @@
+// Each lane stages eight adjacent half values in one packet; 256 lanes
+// cover all 64 rows of the 32-column reduction tile without a row loop.
 // C = silu(A @ Wgate^T + bgate) * (A @ Wup^T + bup).
 // Input, weights and output are float16; accumulation and activation are float32.
 // Each workgroup accumulates both projections for a 64x64 output tile, avoiding
@@ -47,7 +49,7 @@ kernel.def target(@dinov3_matmul_swiglu_wmma_gfx11) export("dinov3_matmul_swiglu
   %n = index.constant 16 : index
   %k = index.constant 16 : index
   %zero_f32x8 = vector.constant 0.0 : vector<8xf32>
-  %zero_f16x4 = vector.constant 0.0 : vector<4xf16>
+  %zero_f16x8 = vector.constant 0.0 : vector<8xf16>
 
   %tile_n_id = kernel.workgroup.id<x> : index
   %tile_m_id = kernel.workgroup.id<y> : index
@@ -89,11 +91,10 @@ kernel.def target(@dinov3_matmul_swiglu_wmma_gfx11) export("dinov3_matmul_swiglu
   %up_result_offset = index.add %wave_result_offset, %up_result_bytes : offset
   %up_result_view = buffer.view %lds[%up_result_offset] : buffer -> view<16x16xf32>
 
-  %load_packet = index.rem %workitem, %c8 : index
-  %load_k = index.mul %load_packet, %c4 : index
-  %load_row0 = index.div %workitem, %c8 : index
-  %load_row = index.assume %load_row0 [range(%load_row0, 0, 31)] : index
-  %load_row_high = index.add %load_row, %c32 : index
+  %load_packet = index.rem %workitem, %c4 : index
+  %load_k = index.mul %load_packet, %c8 : index
+  %load_row0 = index.div %workitem, %c4 : index
+  %load_row = index.assume %load_row0 [range(%load_row0, 0, 63)] : index
 
   %acc_init0 = vector.fragment<init> %zero_f32x8 shape [%m, %n] : vector<8xf32>
   %acc_init1 = vector.fragment<init> %zero_f32x8 shape [%m, %n] : vector<8xf32>
@@ -104,28 +105,25 @@ kernel.def target(@dinov3_matmul_swiglu_wmma_gfx11) export("dinov3_matmul_swiglu
 
   %acc0, %acc1, %acc2, %acc3 = scf.for %k_base = [%c0 to %k_size step %c32](%run0 = %acc_init0 : vector<8xf32>, %run1 = %acc_init1 : vector<8xf32>, %run2 = %acc_init2 : vector<8xf32>, %run3 = %acc_init3 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
     %source_k = index.add %k_base, %load_k : index
-    scf.for %half = [%c0 to %c2 step %c1] unroll {
-      %row_offset = index.mul %half, %c32 : index
-      %row = index.add %load_row, %row_offset : index
-      %source_m = index.add %base_m, %row : index
-      %m_in_range = index.cmp ult, %source_m, %m_size : index
-      %a_values = scf.if %m_in_range -> (vector<4xf16>) {
-        %bounded = index.assume %source_m [lt(%source_m, %m_size)] : index
-        %narrow = vector.load %a_view[%bounded, %source_k] : view<[%m_size]x[%k_size]xf16> -> vector<4xf16>
-        scf.yield %narrow : vector<4xf16>
-      } else {
-        scf.yield %zero_f16x4 : vector<4xf16>
-      }
-      vector.store %a_values, %a_stage_view[%row, %load_k] : vector<4xf16>, view<64x40xf16>
-      %gate_n = index.add %base_n, %row : index
-      %gate_values = vector.load %w_view[%gate_n, %source_k] : view<[%gate_up_rows]x[%k_size]xf16> -> vector<4xf16>
-      vector.store %gate_values, %w_stage_view[%row, %load_k] : vector<4xf16>, view<128x40xf16>
-      %up_n0 = index.add %gate_n, %n_size : index
-      %up_n = index.assume %up_n0 [lt(%up_n0, %gate_up_rows)] : index
-      %up_values = vector.load %w_view[%up_n, %source_k] : view<[%gate_up_rows]x[%k_size]xf16> -> vector<4xf16>
-      %up_row = index.add %row, %c64 : index
-      vector.store %up_values, %w_stage_view[%up_row, %load_k] : vector<4xf16>, view<128x40xf16>
+    %row = index.add %load_row, %c0 : index
+    %source_m = index.add %base_m, %row : index
+    %m_in_range = index.cmp ult, %source_m, %m_size : index
+    %a_values = scf.if %m_in_range -> (vector<8xf16>) {
+      %bounded = index.assume %source_m [lt(%source_m, %m_size)] : index
+      %narrow = vector.load %a_view[%bounded, %source_k] : view<[%m_size]x[%k_size]xf16> -> vector<8xf16>
+      scf.yield %narrow : vector<8xf16>
+    } else {
+      scf.yield %zero_f16x8 : vector<8xf16>
     }
+    vector.store %a_values, %a_stage_view[%row, %load_k] : vector<8xf16>, view<64x40xf16>
+    %gate_n = index.add %base_n, %row : index
+    %gate_values = vector.load %w_view[%gate_n, %source_k] : view<[%gate_up_rows]x[%k_size]xf16> -> vector<8xf16>
+    vector.store %gate_values, %w_stage_view[%row, %load_k] : vector<8xf16>, view<128x40xf16>
+    %up_n0 = index.add %gate_n, %n_size : index
+    %up_n = index.assume %up_n0 [lt(%up_n0, %gate_up_rows)] : index
+    %up_values = vector.load %w_view[%up_n, %source_k] : view<[%gate_up_rows]x[%k_size]xf16> -> vector<8xf16>
+    %up_row = index.add %row, %c64 : index
+    vector.store %up_values, %w_stage_view[%up_row, %load_k] : vector<8xf16>, view<128x40xf16>
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
     %next0, %next1, %next2, %next3 = scf.for %k_half = [%c0 to %c32 step %c16](%half0 = %run0 : vector<8xf32>, %half1 = %run1 : vector<8xf32>, %half2 = %run2 : vector<8xf32>, %half3 = %run3 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll {

@@ -178,6 +178,70 @@ fn compact_rgb_descriptors_preserve_pooling_contract_and_transfer_only_descripto
     Ok(())
 }
 
+#[test]
+#[ignore = "requires pretrained weights and gfx1151"]
+fn descriptor_tiles_preserve_batch_tails_and_warm_replay() -> Result<()> {
+    let model = DINOv3::load(
+        model_path()?,
+        Options {
+            device: 0,
+            max_batch: 64,
+        },
+    )?;
+    let images: Vec<Vec<u8>> = (0..3)
+        .map(|seed| {
+            (0..IMAGE_ELEMENTS)
+                .map(|i| ((i * 13 + i / 379 + seed * 47) % 256) as u8)
+                .collect()
+        })
+        .collect();
+    let masks: Vec<Vec<u8>> = (0..3)
+        .map(|seed| (0..196).map(|i| u8::from((i + seed) % 7 != 0)).collect())
+        .collect();
+    let references = images
+        .iter()
+        .zip(&masks)
+        .map(|(image, mask)| model.describe_rgb(image, mask))
+        .collect::<Result<Vec<_>>>()?;
+    // 201 token rows per image exercise partial and exact 64-row tiles.
+    for batch in [1, 2, 3, 7, 16, 32, 64] {
+        let order: Vec<_> = (0..batch).map(|i| (i * 2 + batch) % 3).collect();
+        let rgb: Vec<_> = order
+            .iter()
+            .flat_map(|&i| images[i].iter().copied())
+            .collect();
+        let mask: Vec<_> = order
+            .iter()
+            .flat_map(|&i| masks[i].iter().copied())
+            .collect();
+        let expected = model.describe_rgb(&rgb, &mask)?;
+        for (actual, &index) in expected.chunks_exact(2 * HIDDEN).zip(&order) {
+            for (a, b) in actual
+                .chunks_exact(HIDDEN)
+                .zip(references[index].chunks_exact(HIDDEN))
+            {
+                let dot = a
+                    .iter()
+                    .zip(b)
+                    .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                    .sum::<f64>();
+                let norm = |row: &[f32]| row.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>();
+                // Batch one uses split-K; preserve the existing full-model
+                // single/batch cosine gate without requiring identical rounding.
+                assert!(dot / (norm(a) * norm(b)).sqrt() > 0.99999, "batch {batch}");
+            }
+        }
+        let before = model.context().runtime().statistics();
+        assert_eq!(model.describe_rgb(&rgb, &mask)?, expected);
+        let after = model.context().runtime().statistics();
+        assert_eq!(after.allocations, before.allocations);
+        assert_eq!(after.native_graphs_prepared, before.native_graphs_prepared);
+        assert_eq!(after.copied_bytes, before.copied_bytes);
+        assert_eq!(after.submissions - before.submissions, 1);
+    }
+    Ok(())
+}
+
 fn model_path() -> Result<std::path::PathBuf> {
     match std::env::var_os("DINOV3_MODEL") {
         Some(path) => Ok(path.into()),
