@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
-description = "DINOv3 ViT-S+/16 inference in Rust for AMD GPUs with HRX and Loom"
+description = "DINOv3 ViT-S+/16 and ViT-B/16 inference in Rust for AMD GPUs with HRX and Loom"
 repository = "https://github.com/zacharydenton/dinov3-hrx"
 include = ["src/**", "kernels/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]
 
@@ -12,7 +12,7 @@ include = ["src/**", "kernels/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.l
 hrx = { package = "hrx-rs", version = "0.7.0" }
 anyhow = "1"
 half = { version = "2", features = ["bytemuck"] }
-bytemuck = "1"
+bytemuck = { version = "1", features = ["min_const_generics"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,3 +21,4 @@ serde_json = "1"
 tempfile = "3"
 matrixmultiply = "0.3"
 safetensors = "0.8"
+libm = "0.2"

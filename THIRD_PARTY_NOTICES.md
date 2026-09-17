@@ -6,7 +6,9 @@ Built with DINOv3.
 
 This project runs Meta's
 [`facebook/dinov3-vits16plus-pretrain-lvd1689m`](https://huggingface.co/facebook/dinov3-vits16plus-pretrain-lvd1689m),
-pinned to revision `c93d816fc9e567563bc068f01475bec89cc634a6`.
+pinned to revision `c93d816fc9e567563bc068f01475bec89cc634a6`, and
+[`facebook/dinov3-vitb16-pretrain-lvd1689m`](https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m),
+pinned to revision `5931719e67bbdb9737e363e781fb0c67687896bc`.
 
 The pretrained model is governed by the
 [DINOv3 License](https://ai.meta.com/resources/models-and-libraries/dinov3-license/),
@@ -25,3 +27,8 @@ revision `c93d816fc9e567563bc068f01475bec89cc634a6`, file `model.safetensors`.
 The validated file SHA-256 is `208146e499dace99e4c9376ddb8a26f77d64c31c46c4dc4b86ff8bc63b0235e2`.
 These are the original model bytes; hosting them on Hugging Face does not change
 the model terms above. Weights are cached outside the Cargo package.
+
+ViT-B automatic downloads use
+[`facebook/dinov3-vitb16-pretrain-lvd1689m`](https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m/tree/5931719e67bbdb9737e363e781fb0c67687896bc),
+revision `5931719e67bbdb9737e363e781fb0c67687896bc`, file `model.safetensors`,
+under the same model terms.

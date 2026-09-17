@@ -5,6 +5,9 @@ use std::{path::PathBuf, time::Instant};
 /// Run inference or measure warm end-to-end inference, including transfers.
 #[derive(Parser)]
 struct Args {
+    /// Architecture to specialize; local weights must match this variant.
+    #[arg(long, default_value = "vits16plus", value_parser = ["vits16plus", "vitb16"])]
+    variant: String,
     /// Local model file; otherwise fetch the pinned weights from Hugging Face.
     #[arg(long)]
     model: Option<PathBuf>,
@@ -25,6 +28,12 @@ struct Args {
 }
 fn main() -> Result<()> {
     let args = Args::parse();
+    match args.variant.as_str() {
+        "vitb16" => run::<ViTB16>(args),
+        _ => run::<ViTS16Plus>(args),
+    }
+}
+fn run<M: ModelSpec>(args: Args) -> Result<()> {
     ensure!(
         (1..=64).contains(&args.max_batch),
         "max_batch must be 1..=64"
@@ -33,7 +42,7 @@ fn main() -> Result<()> {
     let setup = Instant::now();
     let model_path = match args.model {
         Some(path) => path,
-        None => hub::weights(args.offline)?,
+        None => hub::weights_for::<M>(args.offline)?,
     };
     ensure!(
         input.len().is_multiple_of(4),
@@ -45,7 +54,7 @@ fn main() -> Result<()> {
         .iter()
         .map(|x| f32::from_le_bytes(*x))
         .collect();
-    let model = DINOv3::load(
+    let model = DINOv3Model::<M>::load(
         &model_path,
         Options {
             device: args.device,
@@ -54,10 +63,9 @@ fn main() -> Result<()> {
     )?;
     let setup_ms = setup.elapsed().as_secs_f64() * 1000.;
     if args.benchmark > 0 {
-        eprintln!(
-            "{}",
-            serde_json::to_string(&model.benchmark(&input, args.benchmark)?)?
-        );
+        let mut report = serde_json::to_value(model.benchmark(&input, args.benchmark)?)?;
+        report["variant"] = M::NAME.into();
+        eprintln!("{}", serde_json::to_string(&report)?);
     }
     let run = || model.forward(&input);
     let output = run()?;
@@ -83,7 +91,7 @@ fn main() -> Result<()> {
         times.sort_by(f64::total_cmp);
         println!(
             "{}",
-            serde_json::json!({"scope":"warm end-to-end, including transfers","setup_ms":setup_ms,"samples":times.len(),"median_ms":times[times.len()/2],"p95_ms":times[(times.len()*95).div_ceil(100)-1]})
+            serde_json::json!({"variant":M::NAME,"scope":"warm end-to-end, including transfers","setup_ms":setup_ms,"samples":times.len(),"median_ms":times[times.len()/2],"p95_ms":times[(times.len()*95).div_ceil(100)-1]})
         );
     }
     Ok(())

@@ -13,7 +13,7 @@ kernel.def target(@raw_pool_target) export("raw_pool") @raw_pool(%unused:index) 
  %five=index.constant 5 : index
  %patches=index.constant 196 : index
  %tokens=index.constant 201 : index
- %width=index.constant 384 : index
+ %width=index.constant @WIDTH@ : index
  %threads=index.constant 256 : index
  %count=index.constant @COUNT@ : index
  %group=kernel.workgroup.id<x> : index

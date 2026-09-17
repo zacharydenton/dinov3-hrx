@@ -1,25 +1,27 @@
 use super::*;
 
-pub(crate) fn fragment(context: &ModelContext, batch: usize) -> hrx::Result<ModelFragment> {
+pub(crate) fn fragment<M: ModelSpec>(
+    context: &ModelContext,
+    batch: usize,
+) -> hrx::Result<ModelFragment> {
     let mut model = ModelSession::in_context(context)?;
-    let input_desc = TensorDesc::new(DType::F32, vec![batch, TOKENS, HIDDEN])?;
+    let input_desc = TensorDesc::new(DType::F32, vec![batch, TOKENS, M::HIDDEN])?;
     let mask_desc = TensorDesc::new(DType::U8, vec![batch, 196])?;
-    let output_desc = TensorDesc::new(DType::F32, vec![batch, 2, HIDDEN])?;
+    let output_desc = TensorDesc::new(DType::F32, vec![batch, 2, M::HIDDEN])?;
     let tokens = model.allocate(input_desc.bytes())?;
     let masks = model.allocate(mask_desc.bytes())?;
     let pooled = model.allocate(output_desc.bytes())?;
     let output = model.allocate_shared(output_desc.bytes())?;
-    // Both kernels are embedded here; all accesses are bounded by rows*384.
+    // Both kernels are embedded here; all accesses are bounded by rows times model width.
+    let pool_source = include_str!("../kernels/descriptor_pool.loom")
+        .replace("@WIDTH@", &M::HIDDEN.to_string())
+        .replace("@WIDTH_LAST@", &(M::HIDDEN - 1).to_string());
+    let l2_source =
+        include_str!("../kernels/descriptor_l2.loom").replace("@WIDTH@", &M::HIDDEN.to_string());
     let kernels = unsafe {
         model.compile(&[
-            (
-                include_str!("../kernels/descriptor_pool.loom"),
-                Specialization::new("dinov3_pool"),
-            ),
-            (
-                include_str!("../kernels/descriptor_l2.loom"),
-                Specialization::new("dinov3_descriptor_l2"),
-            ),
+            (&pool_source, Specialization::new("dinov3_pool")),
+            (&l2_source, Specialization::new("dinov3_descriptor_l2")),
         ])?
     };
     let rows = (batch * 2) as u32;
@@ -34,7 +36,7 @@ pub(crate) fn fragment(context: &ModelContext, batch: usize) -> hrx::Result<Mode
         Command::Dispatch(Dispatch::indices(
             kernels[1],
             [rows],
-            [(batch * 2 * HIDDEN).div_ceil(256) as u32, 1, 1],
+            [(batch * 2 * M::HIDDEN).div_ceil(256) as u32, 1, 1],
             vec![pooled.read(), output.write()],
         )),
     ];
@@ -48,15 +50,16 @@ pub(crate) fn fragment(context: &ModelContext, batch: usize) -> hrx::Result<Mode
 }
 
 /// Raw summaries preserve the pre-existing public CLS and patch-mean values.
-pub(crate) fn raw_fragment(
+pub(crate) fn raw_fragment<M: ModelSpec>(
     context: &ModelContext,
     batch: usize,
     mean: bool,
 ) -> hrx::Result<ModelFragment> {
-    let input_desc = TensorDesc::new(DType::F32, vec![batch, TOKENS, HIDDEN])?;
-    let output_desc = TensorDesc::new(DType::F32, vec![batch, HIDDEN])?;
+    let input_desc = TensorDesc::new(DType::F32, vec![batch, TOKENS, M::HIDDEN])?;
+    let output_desc = TensorDesc::new(DType::F32, vec![batch, M::HIDDEN])?;
     let mut source = include_str!("../kernels/raw_descriptor.loom").to_owned();
     for (key, value) in [
+        ("WIDTH", M::HIDDEN.to_string()),
         ("GRID", output_desc.elements().div_ceil(256).to_string()),
         ("COUNT", output_desc.elements().to_string()),
         ("LAST", (output_desc.elements() - 1).to_string()),
@@ -92,7 +95,7 @@ mod tests {
     #[ignore = "requires GPU and Loom compiler"]
     fn masked_descriptor_pool_matches_host_including_empty_mask() -> Result<()> {
         let context = ModelContext::new(Default::default())?;
-        let plan = fragment(&context, 2)?.prepare(3)?;
+        let plan = fragment::<ViTS16Plus>(&context, 2)?.prepare(3)?;
         let values = (0..2 * TOKENS * HIDDEN)
             .map(|i| ((i % 71) as f32 - 30.) / 37.)
             .collect::<Vec<_>>();

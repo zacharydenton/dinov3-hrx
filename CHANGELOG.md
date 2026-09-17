@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add compile-time DINOv3 ViT-B/16 support through `DINOv3ViTB`, retaining the
+  existing `DINOv3` default and fixed-size summary arrays. Specialize weight
+  packing, kernels, graph composition, and descriptor pooling for each model.
+- Add 768-channel LayerNorm and fused erf-GELU projection kernels, pinned ViT-B
+  downloads, and CLI/benchmark `--variant vitb16` selection.
+- Validate local weights and batch options before GPU context initialization.
+
 - Widen matrix staging packets and double reduction tiles while preserving
   accumulation order; cover batch tails and allocation-free replay through 64.
 - Use HRX 0.7 graph composition and directly mapped input/output storage.

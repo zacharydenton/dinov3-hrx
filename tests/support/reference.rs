@@ -1,7 +1,7 @@
 use anyhow::{Result, ensure};
 use std::{collections::HashMap, path::Path};
 const T: usize = 201;
-const H: usize = 384;
+
 fn linear(x: &[f64], w: &[f64], bias: Option<&[f64]>, k: usize, n: usize) -> Vec<f64> {
     let m = x.len() / k;
     assert_eq!(w.len(), n * k);
@@ -35,7 +35,7 @@ fn linear(x: &[f64], w: &[f64], bias: Option<&[f64]>, k: usize, n: usize) -> Vec
     }
     out
 }
-fn norm(x: &[f64], w: &[f64], b: &[f64]) -> Vec<f64> {
+fn norm<const H: usize>(x: &[f64], w: &[f64], b: &[f64]) -> Vec<f64> {
     let mut out = x.to_vec();
     for (src, dst) in x.chunks(H).zip(out.chunks_mut(H)) {
         let mean = src.iter().sum::<f64>() / H as f64;
@@ -46,7 +46,7 @@ fn norm(x: &[f64], w: &[f64], b: &[f64]) -> Vec<f64> {
     }
     out
 }
-pub fn forward(path: &Path, image: &[f32]) -> Result<Vec<f64>> {
+pub fn forward<const H: usize>(path: &Path, image: &[f32]) -> Result<Vec<f64>> {
     let file = std::fs::read(path)?;
     let model = safetensors::SafeTensors::deserialize(&file)?;
     let mut weights = HashMap::new();
@@ -91,7 +91,7 @@ pub fn forward(path: &Path, image: &[f32]) -> Result<Vec<f64>> {
     for layer in 0..12 {
         let p = format!("layer.{layer}.");
         let get = |suffix: &str| w(&(p.clone() + suffix));
-        let h = norm(&x, get("norm1.weight"), get("norm1.bias"));
+        let h = norm::<H>(&x, get("norm1.weight"), get("norm1.bias"));
         let mut q = linear(
             &h,
             get("attention.q_proj.weight"),
@@ -110,7 +110,7 @@ pub fn forward(path: &Path, image: &[f32]) -> Result<Vec<f64>> {
         for values in [&mut q, &mut k] {
             for token in 5..T {
                 let patch = token - 5;
-                for head in 0..6 {
+                for head in 0..H / 64 {
                     let base = token * H + head * 64;
                     let original = values[base..base + 64].to_vec();
                     for c in 0..64 {
@@ -130,7 +130,7 @@ pub fn forward(path: &Path, image: &[f32]) -> Result<Vec<f64>> {
         }
         let mut context = vec![0.; T * H];
         let mut scores = vec![0.; T];
-        for head in 0..6 {
+        for head in 0..H / 64 {
             for row in 0..T {
                 for col in 0..T {
                     scores[col] = (0..64)
@@ -161,34 +161,49 @@ pub fn forward(path: &Path, image: &[f32]) -> Result<Vec<f64>> {
         for i in 0..x.len() {
             x[i] += o[i] * get("layer_scale1.lambda1")[i % H];
         }
-        let h = norm(&x, get("norm2.weight"), get("norm2.bias"));
-        let mut gate = linear(
-            &h,
-            get("mlp.gate_proj.weight"),
-            Some(get("mlp.gate_proj.bias")),
-            H,
-            1536,
-        );
-        let up = linear(
-            &h,
-            get("mlp.up_proj.weight"),
-            Some(get("mlp.up_proj.bias")),
-            H,
-            1536,
-        );
-        for (g, u) in gate.iter_mut().zip(up) {
-            *g = *g / (1. + (-*g).exp()) * u;
-        }
+        let h = norm::<H>(&x, get("norm2.weight"), get("norm2.bias"));
+        let intermediate = H * 4;
+        let gate = if H == 384 {
+            let mut gate = linear(
+                &h,
+                get("mlp.gate_proj.weight"),
+                Some(get("mlp.gate_proj.bias")),
+                H,
+                intermediate,
+            );
+            let up = linear(
+                &h,
+                get("mlp.up_proj.weight"),
+                Some(get("mlp.up_proj.bias")),
+                H,
+                intermediate,
+            );
+            for (g, u) in gate.iter_mut().zip(up) {
+                *g = *g / (1. + (-*g).exp()) * u;
+            }
+            gate
+        } else {
+            linear(
+                &h,
+                get("mlp.up_proj.weight"),
+                Some(get("mlp.up_proj.bias")),
+                H,
+                intermediate,
+            )
+            .into_iter()
+            .map(|v| 0.5 * v * (1. + libm::erf(v / std::f64::consts::SQRT_2)))
+            .collect()
+        };
         let down = linear(
             &gate,
             get("mlp.down_proj.weight"),
             Some(get("mlp.down_proj.bias")),
-            1536,
+            intermediate,
             H,
         );
         for i in 0..x.len() {
             x[i] += down[i] * get("layer_scale2.lambda1")[i % H];
         }
     }
-    Ok(norm(&x, w("norm.weight"), w("norm.bias")))
+    Ok(norm::<H>(&x, w("norm.weight"), w("norm.bias")))
 }

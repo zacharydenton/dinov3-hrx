@@ -1,17 +1,36 @@
 //! Compare token/descriptor API latency and readback volume, excluding preparation.
 use anyhow::{Result, ensure};
-use dinov3_hrx::{DINOv3, IMAGE_ELEMENTS, Options};
+use clap::Parser;
+use dinov3_hrx::{DINOv3Model, IMAGE_ELEMENTS, ModelSpec, Options, ViTB16, ViTS16Plus};
 use std::time::Instant;
+#[derive(Parser)]
+struct Args {
+    #[arg(default_value = "rgb")]
+    mode: String,
+    #[arg(default_value_t = 1)]
+    batch: usize,
+    #[arg(default_value_t = 100)]
+    samples: usize,
+    output: Option<std::path::PathBuf>,
+    #[arg(long, default_value = "vits16plus", value_parser = ["vits16plus", "vitb16"])]
+    variant: String,
+}
 fn main() -> Result<()> {
-    let args = std::env::args().collect::<Vec<_>>();
-    let mode = args.get(1).map(String::as_str).unwrap_or("rgb");
-    let batch: usize = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(1);
-    let samples: usize = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(100);
+    let args = Args::parse();
+    match args.variant.as_str() {
+        "vitb16" => run::<ViTB16>(args),
+        _ => run::<ViTS16Plus>(args),
+    }
+}
+fn run<M: ModelSpec>(args: Args) -> Result<()> {
+    let mode = args.mode.as_str();
+    let batch = args.batch;
+    let samples = args.samples;
     ensure!(
         batch > 0 && batch <= 64 && samples > 0,
         "invalid batch/samples"
     );
-    let model = DINOv3::from_pretrained(Options {
+    let model = DINOv3Model::<M>::from_pretrained(Options {
         max_batch: batch,
         ..Default::default()
     })?;
@@ -32,8 +51,8 @@ fn main() -> Result<()> {
     let run = || -> Result<Vec<f32>> {
         Ok(match mode {
             "tokens" => model.forward(&input)?,
-            "cls" => model.cls(&input)?.into_iter().flatten().collect(),
-            "mean" => model.patch_mean(&input)?.into_iter().flatten().collect(),
+            "cls" => bytemuck::cast_slice(&model.cls(&input)?).to_vec(),
+            "mean" => bytemuck::cast_slice(&model.patch_mean(&input)?).to_vec(),
             "describe" => model.descriptors(&input, &masks)?,
             "rgb" => model.describe_rgb(&rgb, &masks)?,
             _ => anyhow::bail!("expected tokens, cls, mean, describe or rgb"),
@@ -51,13 +70,13 @@ fn main() -> Result<()> {
     }
     let after = model.context().runtime().statistics();
     let output = run()?;
-    if let Some(path) = args.get(4) {
+    if let Some(path) = args.output {
         std::fs::write(path, bytemuck::cast_slice(&output))?;
     }
     times.sort_by(f64::total_cmp);
     println!(
         "{}",
-        serde_json::json!({"mode":mode,"batch":batch,"samples":samples,
+        serde_json::json!({"variant":M::NAME,"mode":mode,"batch":batch,"samples":samples,
         "median_ms":times[samples/2],"p95_ms":times[(samples*95).div_ceil(100)-1],
         "download_bytes_per_call":(after.downloaded_bytes-before.downloaded_bytes)/samples as u64,
         "warm_ms":times})

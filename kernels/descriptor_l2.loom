@@ -2,7 +2,7 @@ amdgpu.target<gfx11-generic> @dinov3_descriptor_l2_target {subgroup_size = 32}
 kernel.def target(@dinov3_descriptor_l2_target) export("dinov3_descriptor_l2") @dinov3_descriptor_l2(%rows: index) {
   %one = index.constant 1 : index
   %threads = index.constant 256 : index
-  %width = index.constant 384 : index
+  %width = index.constant @WIDTH@ : index
   %count = index.mul %rows, %width : index
   %extra = index.constant 255 : index
   %rounded = index.add %count, %extra : index
@@ -15,11 +15,11 @@ kernel.def target(@dinov3_descriptor_l2_target) export("dinov3_descriptor_l2") @
   %c5 = index.constant 5 : index
   %c196 = index.constant 196 : index
   %c201 = index.constant 201 : index
-  %c384 = index.constant 384 : index
+  %width = index.constant @WIDTH@ : index
   %c256 = index.constant 256 : index
   %off = index.constant 0 : offset
   %rows_bounded = index.assume %rows [range(%rows, 1, 128)] : index
-  %count = index.mul %rows_bounded, %c384 : index
+  %count = index.mul %rows_bounded, %width : index
   %group = kernel.workgroup.id<x> : index
   %lane = kernel.workitem.id<x> : index
   %base = index.mul %group, %c256 : index
@@ -29,16 +29,16 @@ kernel.def target(@dinov3_descriptor_l2_target) export("dinov3_descriptor_l2") @
   %one = scalar.constant 1.0 : f32
   scf.if %valid {
     %i = index.assume %raw [lt(%raw, %count)] : index
-    %row = index.div %i, %c384 : index
-    %channel = index.rem %i, %c384 : index
+    %row = index.div %i, %width : index
+    %channel = index.rem %i, %width : index
 
     %ig = buffer.assume.memory_space<global> %input : buffer
     %og = buffer.assume.memory_space<global> %output : buffer
     %iv = buffer.view %ig[%off] : buffer -> view<[%count]xf32>
     %ov = buffer.view %og[%off] : buffer -> view<[%count]xf32>
-    %start = index.mul %row, %c384 : index
+    %start = index.mul %row, %width : index
     // Compensated f32 accumulation: this target's Loom ABI has no f64 arithmetic.
-    %sum, %correction = scf.for %j = [%c0 to %c384 step %c1](%acc = %zero : f32, %error = %zero : f32) -> (f32, f32) {
+    %sum, %correction = scf.for %j = [%c0 to %width step %c1](%acc = %zero : f32, %error = %zero : f32) -> (f32, f32) {
       %at = index.add %start, %j : index
       %safe = index.assume %at [lt(%at, %count)] : index
       %v = view.load %iv[%safe] : view<[%count]xf32> -> f32
