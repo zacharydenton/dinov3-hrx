@@ -91,12 +91,10 @@ pub(crate) fn raw_fragment<M: ModelSpec>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    #[ignore = "requires GPU and Loom compiler"]
-    fn masked_descriptor_pool_matches_host_including_empty_mask() -> Result<()> {
+    fn check_pooling<M: ModelSpec>() -> Result<()> {
         let context = ModelContext::new(Default::default())?;
-        let plan = fragment::<ViTS16Plus>(&context, 2)?.prepare(3)?;
-        let values = (0..2 * TOKENS * HIDDEN)
+        let plan = fragment::<M>(&context, 2)?.prepare(3)?;
+        let values = (0..2 * TOKENS * M::HIDDEN)
             .map(|i| ((i % 71) as f32 - 30.) / 37.)
             .collect::<Vec<_>>();
         let masks = (0..392)
@@ -115,14 +113,15 @@ mod tests {
             .collect::<Vec<_>>();
         let mut expected = Vec::new();
         for b in 0..2 {
-            let mut cls = values[b * TOKENS * HIDDEN..b * TOKENS * HIDDEN + HIDDEN].to_vec();
-            let mut mean = vec![0f32; HIDDEN];
+            let mut cls =
+                values[b * TOKENS * M::HIDDEN..b * TOKENS * M::HIDDEN + M::HIDDEN].to_vec();
+            let mut mean = vec![0f32; M::HIDDEN];
             let mut kept = 0;
             for p in 0..196 {
                 if masks[b * 196 + p] != 0 {
                     kept += 1;
-                    for h in 0..HIDDEN {
-                        mean[h] += values[(b * TOKENS + p + 5) * HIDDEN + h];
+                    for h in 0..M::HIDDEN {
+                        mean[h] += values[(b * TOKENS + p + 5) * M::HIDDEN + h];
                     }
                 }
             }
@@ -144,5 +143,15 @@ mod tests {
             assert!((a - e).abs() < 2e-7, "{a} vs {e}");
         }
         Ok(())
+    }
+    #[test]
+    #[ignore = "requires GPU and Loom compiler"]
+    fn masked_descriptor_pool_matches_host_including_empty_mask() -> Result<()> {
+        check_pooling::<ViTS16>()?;
+        check_pooling::<ViTS16Plus>()?;
+        check_pooling::<ViTB16>()?;
+        check_pooling::<ViTL16>()?;
+        check_pooling::<ViTH16Plus>()?;
+        check_pooling::<ViT7B16>()
     }
 }

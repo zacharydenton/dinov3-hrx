@@ -32,3 +32,20 @@ ViT-B automatic downloads use
 [`facebook/dinov3-vitb16-pretrain-lvd1689m`](https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m/tree/5931719e67bbdb9737e363e781fb0c67687896bc),
 revision `5931719e67bbdb9737e363e781fb0c67687896bc`, file `model.safetensors`,
 under the same model terms.
+
+## Additional ViT checkpoints
+
+The same DINOv3 terms apply to these additional LVD-1689M checkpoints:
+
+- [facebook/dinov3-vits16-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vits16-pretrain-lvd1689m/tree/114c1379950215c8b35dfcd4e90a5c251dde0d32),
+  revision `114c1379950215c8b35dfcd4e90a5c251dde0d32`.
+- [facebook/dinov3-vitl16-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m/tree/ea8dc2863c51be0a264bab82070e3e8836b02d51),
+  revision `ea8dc2863c51be0a264bab82070e3e8836b02d51`.
+- [facebook/dinov3-vith16plus-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vith16plus-pretrain-lvd1689m/tree/c807c9eeea853df70aec4069e6f56b28ddc82acc),
+  revision `c807c9eeea853df70aec4069e6f56b28ddc82acc`.
+- [facebook/dinov3-vit7b16-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vit7b16-pretrain-lvd1689m/tree/b80367753773648a6793235ab9c65cdbb029506f),
+  revision `b80367753773648a6793235ab9c65cdbb029506f`.
+
+ViT-7B uses `model.safetensors.index.json` and its six listed SafeTensors shards.
+The other checkpoints use `model.safetensors`. All weights remain separately
+downloaded artifacts outside this repository and its Cargo package.

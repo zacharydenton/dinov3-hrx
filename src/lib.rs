@@ -1,5 +1,6 @@
-//! DINOv3 ViT-S+/16 and ViT-B/16 at 224×224, specialized by model type.
+//! DINOv3 ViT inference at 224×224, specialized by model type.
 //! Inputs are normalized RGB NCHW; outputs are tokens or compact descriptors.
+mod checkpoint;
 pub mod hub;
 mod pooling;
 mod preprocess;
@@ -16,7 +17,7 @@ use hrx::{
     plan_cache::PlanCache,
     tensor::{DType, DeviceTensor, Layout, TensorDesc},
 };
-pub use spec::{ModelSpec, ViTB16, ViTS16Plus};
+pub use spec::{ModelSpec, ViT7B16, ViTB16, ViTH16Plus, ViTL16, ViTS16, ViTS16Plus};
 use std::marker::PhantomData;
 use std::{collections::HashMap, path::Path};
 
@@ -55,6 +56,14 @@ pub struct DINOv3Model<M: ModelSpec> {
 pub type DINOv3 = DINOv3Model<ViTS16Plus>;
 /// ViT-B/16 model with 768-feature outputs.
 pub type DINOv3ViTB = DINOv3Model<ViTB16>;
+/// ViT-S/16 with GELU (distinct from the default ViT-S+).
+pub type DINOv3ViTS = DINOv3Model<ViTS16>;
+/// ViT-L/16 with 1024-feature outputs.
+pub type DINOv3ViTL = DINOv3Model<ViTL16>;
+/// ViT-H+/16 with 1280-feature outputs.
+pub type DINOv3ViTH = DINOv3Model<ViTH16Plus>;
+/// ViT-7B/16 with 4096-feature outputs and 128-channel attention heads.
+pub type DINOv3ViT7B = DINOv3Model<ViT7B16>;
 impl<M: ModelSpec> DINOv3Model<M> {
     /// Feature width of this model architecture.
     pub const HIDDEN: usize = M::HIDDEN;
@@ -71,6 +80,7 @@ impl<M: ModelSpec> DINOv3Model<M> {
     }
 
     /// Validate and pack the model, compile kernels, and allocate resident storage.
+    /// Accepts a SafeTensors file, a shard index, or a checkpoint directory.
     pub fn load(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         ensure!(
             (1..=64).contains(&options.max_batch),
@@ -429,7 +439,7 @@ impl<M: ModelSpec> DINOv3Model<M> {
             .zip(sizes)
             .map(|(&region, bytes)| region.slice(0, bytes))
             .collect::<hrx::Result<Vec<_>>>()?;
-        let [x, h, q, attn, act, out, patched, image, partials]: [Region; 9] =
+        let [x, h, q, attn, act, out, patched, image, partials, raw_qkv]: [Region; 10] =
             shaped.try_into().unwrap();
         let w = |s: &str| self.weights[s];
         let mut commands = vec![Command::Fill {
@@ -483,14 +493,33 @@ impl<M: ModelSpec> DINOv3Model<M> {
         for i in 0..M::LAYERS {
             let s = format!("l{i}_");
             let wt = |suffix: &str| w(&(s.clone() + suffix));
-            add(
-                4,
-                r,
-                [(3 * M::HIDDEN / 64) as u32, r.div_ceil(64), 1],
-                vec![h, wt("qkv_w"), wt("qkv_b"), q, w("rope_cos"), w("rope_sin")],
-                q,
-                false,
-            );
+            if M::HEAD_DIM == 64 {
+                add(
+                    4,
+                    r,
+                    [(3 * M::HIDDEN / 64) as u32, r.div_ceil(64), 1],
+                    vec![h, wt("qkv_w"), wt("qkv_b"), q, w("rope_cos"), w("rope_sin")],
+                    q,
+                    false,
+                );
+            } else {
+                add(
+                    4,
+                    r,
+                    [(3 * M::HIDDEN / 64) as u32, r.div_ceil(64), 1],
+                    vec![h, wt("qkv_w"), wt("qkv_b"), raw_qkv],
+                    raw_qkv,
+                    false,
+                );
+                add(
+                    11,
+                    r,
+                    [(r as usize * 3 * M::HIDDEN).div_ceil(256) as u32, 1, 1],
+                    vec![raw_qkv, w("rope_cos"), w("rope_sin"), q],
+                    q,
+                    false,
+                );
+            }
             let k = q.slice(M::HIDDEN * 2, q.len() - M::HIDDEN * 2)?;
             let v = q.slice(M::HIDDEN * 4, q.len() - M::HIDDEN * 4)?;
             add(
@@ -582,15 +611,20 @@ impl<M: ModelSpec> DINOv3Model<M> {
             false,
         );
         // The embedded kernels obey the scalar, region and access contracts above.
+        // Every private activation is written before use; QKV padding is filled
+        // above. Residual and split-K paths need no initial scratch contents.
         unsafe {
-            Ok(self.engine.fragment(
-                &commands,
-                &[(image, TensorDesc::new(DType::F32, vec![b, 196, 768])?)],
-                &[(
-                    out,
-                    TensorDesc::new(DType::F32, vec![b, TOKENS, M::HIDDEN])?,
-                )],
-            )?)
+            Ok(self
+                .engine
+                .fragment(
+                    &commands,
+                    &[(image, TensorDesc::new(DType::F32, vec![b, 196, 768])?)],
+                    &[(
+                        out,
+                        TensorDesc::new(DType::F32, vec![b, TOKENS, M::HIDDEN])?,
+                    )],
+                )?
+                .reuse_private_scratch())
         }
     }
 }
@@ -611,13 +645,14 @@ fn patchify(input: &[f32], out: &mut [f32]) {
         }
     }
 }
-// Residuals, normalized input, QKV, attention and MLP activations are F16.
+// Residuals are F32 for large models to preserve register-token outliers.
+// Normalized input, QKV, attention and MLP activations are F16.
 // Final tokens, patch embeddings, image patches and split-K partials are F32.
-fn buffer_sizes<M: ModelSpec>(batch: usize) -> [usize; 9] {
+fn buffer_sizes<M: ModelSpec>(batch: usize) -> [usize; 10] {
     let rows = batch * TOKENS;
     let patches = batch * 196;
     [
-        rows * M::HIDDEN * 2,
+        rows * M::HIDDEN * if M::RESIDUAL_F32 { 4 } else { 2 },
         rows * M::HIDDEN * 2,
         (rows + 16) * 3 * M::HIDDEN * 2,
         rows * M::HIDDEN * 2,
@@ -626,6 +661,11 @@ fn buffer_sizes<M: ModelSpec>(batch: usize) -> [usize; 9] {
         patches * M::HIDDEN * 4,
         patches * 768 * 4,
         4 * TOKENS * M::HIDDEN * 4,
+        if M::HEAD_DIM == 128 {
+            rows * 3 * M::HIDDEN * 4
+        } else {
+            4
+        },
     ]
 }
 fn specifications<M: ModelSpec>() -> Vec<(&'static str, Specialization)> {
@@ -636,25 +676,50 @@ fn specifications<M: ModelSpec>() -> Vec<(&'static str, Specialization)> {
         s.push((include_str!(concat!("../kernels/",$file,".loom")),spec));
     }}; }
     spec!("matmul_bias_f16_wmma","matmul_bias_f16_wmma",["k_size"=>768,"n_size"=>M::HIDDEN]);
-    spec!("embed_scatter_f32","embed_scatter_f32",["hidden_size"=>M::HIDDEN,"tokens_per_image"=>201,"prefix"=>5]);
+    if M::RESIDUAL_F32 {
+        spec!("embed_scatter_residual_f32","embed_scatter_residual_f32",["hidden_size"=>M::HIDDEN,"tokens_per_image"=>201,"prefix"=>5]);
+    } else {
+        spec!("embed_scatter_f32","embed_scatter_f32",["hidden_size"=>M::HIDDEN,"tokens_per_image"=>201,"prefix"=>5]);
+    }
     if M::HIDDEN == 384 {
         spec!("layernorm_rowwave_f16","layernorm_rowwave_f16",["hidden_size"=>M::HIDDEN,"epsilon"=>"1e-5"]);
         spec!("layernorm_rowwave_f32out","layernorm_rowwave_f32out",["hidden_size"=>M::HIDDEN,"epsilon"=>"1e-5"]);
-    } else {
+    } else if M::HIDDEN == 768 {
         spec!("layernorm_rowwave_768_f16","layernorm_rowwave_768_f16",["hidden_size"=>M::HIDDEN,"epsilon"=>"1e-5"]);
         spec!("layernorm_rowwave_768_f32out","layernorm_rowwave_768_f32out",["hidden_size"=>M::HIDDEN,"epsilon"=>"1e-5"]);
     }
-    spec!("matmul_qkv_rope_f16_wmma","matmul_qkv_rope_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>3*M::HIDDEN,"head_dim"=>64,"prefix"=>5,"tokens_per_image"=>201,"rope_channels"=>2*M::HIDDEN]);
-    spec!("attention_online_f16_wmma_cf16","attention_online_f16_wmma_cf16",["hidden_size"=>M::HIDDEN,"qkv_stride"=>3*M::HIDDEN,"tokens_per_image"=>201,"scale"=>0.125,"max_images"=>64,"token_capacity"=>262144]);
-    spec!("matmul_resid_f16_wmma","matmul_resid_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::HIDDEN]);
-    spec!("matmul_resid_f16_wmma","matmul_resid_f16_wmma",["k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN]);
+    if M::HIDDEN > 768 {
+        spec!("layernorm_rowwave_wide_f16","layernorm_rowwave_wide_f16",["hidden_size"=>M::HIDDEN,"epsilon"=>"1e-5"]);
+        spec!("layernorm_rowwave_wide_f32out","layernorm_rowwave_wide_f32out",["hidden_size"=>M::HIDDEN,"epsilon"=>"1e-5"]);
+    }
+    if M::HEAD_DIM == 64 {
+        spec!("matmul_qkv_rope_f16_wmma","matmul_qkv_rope_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>3*M::HIDDEN,"head_dim"=>64,"prefix"=>5,"tokens_per_image"=>201,"rope_channels"=>2*M::HIDDEN]);
+        spec!("attention_online_f16_wmma_cf16","attention_online_f16_wmma_cf16",["hidden_size"=>M::HIDDEN,"qkv_stride"=>3*M::HIDDEN,"tokens_per_image"=>201,"scale"=>0.125,"max_images"=>64,"token_capacity"=>262144]);
+    } else {
+        spec!("matmul_qkv_f32out","matmul_qkv_f32out",["k_size"=>M::HIDDEN,"n_size"=>3*M::HIDDEN]);
+        spec!("attention_online_f16_wmma_h128","attention_online_f16_wmma_h128",["hidden_size"=>M::HIDDEN,"qkv_stride"=>3*M::HIDDEN,"tokens_per_image"=>201,"scale"=>1.0_f64/128.0_f64.sqrt(),"max_images"=>64,"token_capacity"=>16384]);
+    }
+    if M::RESIDUAL_F32 {
+        spec!("matmul_resid_f32_wmma","matmul_resid_f32_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::HIDDEN]);
+        spec!("matmul_resid_f32_wmma","matmul_resid_f32_wmma",["k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN]);
+    } else {
+        spec!("matmul_resid_f16_wmma","matmul_resid_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::HIDDEN]);
+        spec!("matmul_resid_f16_wmma","matmul_resid_f16_wmma",["k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN]);
+    }
     if M::GATED {
         spec!("matmul_swiglu_f16_wmma","matmul_swiglu_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::INTERMEDIATE]);
     } else {
         spec!("matmul_gelu_f16_wmma","matmul_gelu_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::INTERMEDIATE]);
     }
     spec!("matmul_splitk_f16_wmma","matmul_splitk_f16_wmma",["k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN,"splits"=>4]);
-    spec!("splitk_reduce_f16","splitk_reduce_f16",["n_size"=>M::HIDDEN,"splits"=>4]);
+    if M::RESIDUAL_F32 {
+        spec!("splitk_reduce_f32","splitk_reduce_f32",["n_size"=>M::HIDDEN,"splits"=>4]);
+    } else {
+        spec!("splitk_reduce_f16","splitk_reduce_f16",["n_size"=>M::HIDDEN,"splits"=>4]);
+    }
+    if M::HEAD_DIM == 128 {
+        spec!("rope_f32_to_f16","rope_f32_to_f16",["hidden_size"=>M::HIDDEN]);
+    }
     s
 }
 

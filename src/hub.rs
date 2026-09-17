@@ -18,10 +18,18 @@ pub fn weights(offline: bool) -> Result<PathBuf> {
 }
 
 /// Resolve the pinned checkpoint for a compile-time model architecture.
+/// Returns a SafeTensors file, or an index after fetching every required shard.
 pub fn weights_for<M: ModelSpec>(offline: bool) -> Result<PathBuf> {
-    Ok(
-        Resolver::new(Repository::new("facebook", M::REPO).at(M::REVISION))
-            .offline(offline)
-            .resolve(&HubFile::new(FILE))?,
-    )
+    let resolver =
+        Resolver::new(Repository::new("facebook", M::REPO).at(M::REVISION)).offline(offline);
+    if M::SHARDED {
+        let path = resolver.resolve(&HubFile::new("model.safetensors.index.json"))?;
+        let index = crate::checkpoint::Index::read(&path)?;
+        for file in index.files() {
+            resolver.resolve(&HubFile::new(file))?;
+        }
+        Ok(path)
+    } else {
+        Ok(resolver.resolve(&HubFile::new(FILE))?)
+    }
 }

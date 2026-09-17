@@ -1,7 +1,10 @@
 //! Compare token/descriptor API latency and readback volume, excluding preparation.
 use anyhow::{Result, ensure};
 use clap::Parser;
-use dinov3_hrx::{DINOv3Model, IMAGE_ELEMENTS, ModelSpec, Options, ViTB16, ViTS16Plus};
+use dinov3_hrx::{
+    DINOv3Model, IMAGE_ELEMENTS, ModelSpec, Options, ViT7B16, ViTB16, ViTH16Plus, ViTL16, ViTS16,
+    ViTS16Plus,
+};
 use std::time::Instant;
 #[derive(Parser)]
 struct Args {
@@ -12,12 +15,16 @@ struct Args {
     #[arg(default_value_t = 100)]
     samples: usize,
     output: Option<std::path::PathBuf>,
-    #[arg(long, default_value = "vits16plus", value_parser = ["vits16plus", "vitb16"])]
+    #[arg(long, default_value = "vits16plus", value_parser = ["vits16plus", "vitb16", "vits16", "vitl16", "vith16plus", "vit7b16"])]
     variant: String,
 }
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.variant.as_str() {
+        "vits16" => run::<ViTS16>(args),
+        "vitl16" => run::<ViTL16>(args),
+        "vith16plus" => run::<ViTH16Plus>(args),
+        "vit7b16" => run::<ViT7B16>(args),
         "vitb16" => run::<ViTB16>(args),
         _ => run::<ViTS16Plus>(args),
     }

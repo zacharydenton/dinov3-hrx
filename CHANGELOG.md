@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 — 2026-09-18
+
+- Require published HRX 0.7.1 for reusable private graph scratch.
+- Add compile-time ViT-S/16, ViT-L/16, ViT-H+/16, and ViT-7B/16 models, with
+  pinned LVD-1689M checkpoints and matching CLI/benchmark variants.
+- Load sharded SafeTensors checkpoints by index or directory while buffering one
+  source shard at a time. Handle ViT-7B's bias-free Q/V projections and 128-wide
+  heads with F32 RoPE and specialized attention.
+- Preserve large-model register-token outliers using F32 residual streams and
+  wide LayerNorm, while retaining F16 matrix inputs and weights.
 
 - Add compile-time DINOv3 ViT-B/16 support through `DINOv3ViTB`, retaining the
   existing `DINOv3` default and fixed-size summary arrays. Specialize weight
@@ -25,7 +34,7 @@
 - Unroll fixed staging and publication loops in five WMMA kernels.
 - Size the float16 residual allocation correctly, saving 154,368 bytes per reserved image.
 
-## 0.1.0 — Rust migration
+### Rust migration
 
 - Renamed `dinov3-loom` to `dinov3-hrx`.
 - Replaced the Python package and C ABI with a Rust library and CLI using HRX 0.4.0.

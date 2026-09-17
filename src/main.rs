@@ -6,7 +6,7 @@ use std::{path::PathBuf, time::Instant};
 #[derive(Parser)]
 struct Args {
     /// Architecture to specialize; local weights must match this variant.
-    #[arg(long, default_value = "vits16plus", value_parser = ["vits16plus", "vitb16"])]
+    #[arg(long, default_value = "vits16plus", value_parser = ["vits16plus", "vitb16", "vits16", "vitl16", "vith16plus", "vit7b16"])]
     variant: String,
     /// Local model file; otherwise fetch the pinned weights from Hugging Face.
     #[arg(long)]
@@ -29,6 +29,10 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.variant.as_str() {
+        "vits16" => run::<ViTS16>(args),
+        "vitl16" => run::<ViTL16>(args),
+        "vith16plus" => run::<ViTH16Plus>(args),
+        "vit7b16" => run::<ViT7B16>(args),
         "vitb16" => run::<ViTB16>(args),
         _ => run::<ViTS16Plus>(args),
     }

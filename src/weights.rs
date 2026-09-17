@@ -1,7 +1,8 @@
 use crate::ModelSpec;
+use crate::checkpoint::Checkpoint;
 use anyhow::{Result, ensure};
 use half::{bf16, f16};
-use hrx::artifacts::safetensors::{DType, FileView};
+use hrx::artifacts::safetensors::DType;
 use std::{collections::HashMap, path::Path};
 
 fn pack_f16(name: &str, values: &[f32]) -> Result<Vec<u8>> {
@@ -18,8 +19,13 @@ fn pack_f16(name: &str, values: &[f32]) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn load<M: ModelSpec>(path: &Path) -> Result<HashMap<String, Vec<u8>>> {
-    let tensors = FileView::read(path)?;
-    let get = |name: &str, shape: &[usize]| -> Result<Vec<f32>> {
+    let mut tensors = Checkpoint::open(path)?;
+    ensure!(
+        M::GATED || !tensors.contains("layer.0.mlp.gate_proj.weight")?,
+        "checkpoint uses a gated MLP, but {} expects GELU",
+        M::NAME
+    );
+    let mut get = |name: &str, shape: &[usize]| -> Result<Vec<f32>> {
         let t = tensors.get(name)?;
         ensure!(
             t.shape == shape,
@@ -102,7 +108,7 @@ pub(crate) fn load<M: ModelSpec>(path: &Path) -> Result<HashMap<String, Vec<u8>>
                 &format!("{p}attention.{q}_proj.weight"),
                 &[M::HIDDEN, M::HIDDEN],
             )?);
-            qb.extend(if q == "k" {
+            qb.extend(if q == "k" || !M::QV_BIAS {
                 vec![0.; M::HIDDEN]
             } else {
                 get(&format!("{p}attention.{q}_proj.bias"), &[M::HIDDEN])?
@@ -162,9 +168,10 @@ pub(crate) fn load<M: ModelSpec>(path: &Path) -> Result<HashMap<String, Vec<u8>>
         for x in 0..14 {
             for _ in 0..2 {
                 for pos in [y, x] {
-                    for j in 0..16 {
+                    for j in 0..M::HEAD_DIM / 4 {
                         let coord = 2. * (pos as f64 + 0.5) / 14. - 1.;
-                        let a = 2. * std::f64::consts::PI * coord / 100f64.powf(j as f64 / 16.);
+                        let a = 2. * std::f64::consts::PI * coord
+                            / 100f64.powf(j as f64 / (M::HEAD_DIM / 4) as f64);
                         cos.push(a.cos() as f32);
                         sin.push(a.sin() as f32);
                     }

@@ -72,11 +72,7 @@ fn full_reference_and_changing_batch<M: ModelSpec>() -> Result<()> {
     let batched = model.forward(&images)?;
     for (i, img) in images.chunks(IMAGE_ELEMENTS).enumerate() {
         let got = model.forward(img)?;
-        let want = if M::HIDDEN == 384 {
-            reference::forward::<384>(&path, img)?
-        } else {
-            reference::forward::<768>(&path, img)?
-        };
+        let want = reference::forward(&path, img, M::NAME)?;
         let compare = |a: &[f32], b: &[f64]| {
             let dot = a.iter().zip(b).map(|(a, b)| *a as f64 * b).sum::<f64>();
             let aa = a.iter().map(|a| (*a as f64).powi(2)).sum::<f64>();
@@ -244,10 +240,14 @@ fn descriptor_tiles_preserve_batch_tails_and_warm_replay<M: ModelSpec>() -> Resu
 }
 
 fn model_path<M: ModelSpec>() -> Result<std::path::PathBuf> {
-    match std::env::var_os(if M::GATED {
-        "DINOV3_MODEL"
-    } else {
-        "DINOV3_VITB_MODEL"
+    match std::env::var_os(match M::NAME {
+        "vits16plus" => "DINOV3_MODEL",
+        "vitb16" => "DINOV3_VITB_MODEL",
+        "vits16" => "DINOV3_VITS_MODEL",
+        "vitl16" => "DINOV3_VITL_MODEL",
+        "vith16plus" => "DINOV3_VITH_MODEL",
+        "vit7b16" => "DINOV3_VIT7B_MODEL",
+        _ => unreachable!(),
     }) {
         Some(path) => Ok(path.into()),
         None => dinov3_hrx::hub::weights_for::<M>(false),
@@ -369,6 +369,18 @@ fn model_types_preserve_array_widths() {
     let _: SmallSummary = DINOv3::patch_mean;
     let _: BaseSummary = DINOv3ViTB::cls;
     let _: BaseSummary = DINOv3ViTB::patch_mean;
+    type LargeSummary = fn(&DINOv3ViTL, &[f32]) -> Result<Vec<[f32; 1024]>>;
+    type HugeSummary = fn(&DINOv3ViTH, &[f32]) -> Result<Vec<[f32; 1280]>>;
+    type GiantSummary = fn(&DINOv3ViT7B, &[f32]) -> Result<Vec<[f32; 4096]>>;
+    type PlainSmallSummary = fn(&DINOv3ViTS, &[f32]) -> Result<Vec<[f32; 384]>>;
+    let _: PlainSmallSummary = DINOv3ViTS::cls;
+    let _: PlainSmallSummary = DINOv3ViTS::patch_mean;
+    let _: LargeSummary = DINOv3ViTL::cls;
+    let _: HugeSummary = DINOv3ViTH::cls;
+    let _: GiantSummary = DINOv3ViT7B::cls;
+    let _: LargeSummary = DINOv3ViTL::patch_mean;
+    let _: HugeSummary = DINOv3ViTH::patch_mean;
+    let _: GiantSummary = DINOv3ViT7B::patch_mean;
     assert_eq!(DINOv3::HIDDEN, HIDDEN);
     assert_eq!(DINOv3ViTB::HIDDEN, 768);
 }
@@ -469,5 +481,125 @@ fn rejects_checkpoint_architecture_mismatch_before_gpu_initialization() -> Resul
             "{error}"
         );
     }
+    Ok(())
+}
+
+fn family_reference_and_outputs<M: ModelSpec>() -> Result<()> {
+    let path = model_path::<M>()?;
+    let model = DINOv3Model::<M>::load(
+        &path,
+        Options {
+            device: 0,
+            max_batch: 2,
+        },
+    )?;
+    let pixels: Vec<_> = (0..3 * IMAGE_ELEMENTS)
+        .map(|i| ((i as f64 * 0.037).sin() * 0.6) as f32)
+        .collect();
+    let first = &pixels[..IMAGE_ELEMENTS];
+    let got = model.forward(first)?;
+    assert!(
+        got.iter().all(|x| x.is_finite()),
+        "{} produced non-finite output",
+        M::NAME
+    );
+    eprintln!("{} GPU output is finite; computing F64 reference", M::NAME);
+    let want = reference::forward(&path, first, M::NAME)?;
+    fn cosine(a: &[f32], b: &[f64]) -> f64 {
+        let dot = a.iter().zip(b).map(|(&x, &y)| x as f64 * y).sum::<f64>();
+        dot / (a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>()
+            * b.iter().map(|x| x * x).sum::<f64>())
+        .sqrt()
+    }
+    eprintln!(
+        "{} GPU finite {}/{} max {} reference finite {}/{} max {}",
+        M::NAME,
+        got.iter().filter(|x| x.is_finite()).count(),
+        got.len(),
+        got.iter()
+            .copied()
+            .filter(|x| x.is_finite())
+            .map(f32::abs)
+            .fold(0f32, f32::max),
+        want.iter().filter(|x| x.is_finite()).count(),
+        want.len(),
+        want.iter()
+            .copied()
+            .filter(|x| x.is_finite())
+            .map(f64::abs)
+            .fold(0f64, f64::max)
+    );
+    let all = cosine(&got, &want);
+    let cls = cosine(&got[..M::HIDDEN], &want[..M::HIDDEN]);
+    eprintln!("{} reference: all={all}, CLS={cls}", M::NAME);
+    assert!(all > 0.9999 && cls > 0.9999);
+    let batched = model.forward(&pixels)?;
+    assert_eq!(batched.len(), 3 * TOKENS * M::HIDDEN);
+    assert!(
+        cosine(
+            &batched[..TOKENS * M::HIDDEN],
+            &got.iter().map(|&x| x as f64).collect::<Vec<_>>()
+        ) > 0.99999
+    );
+    assert_eq!(model.forward(&pixels)?, batched);
+    assert_eq!(model.cls(first)?[0].as_ref(), &got[..M::HIDDEN]);
+    let means = model.patch_mean(first)?;
+    let mut mean = vec![0f32; M::HIDDEN];
+    for row in got[5 * M::HIDDEN..].chunks(M::HIDDEN) {
+        for (sum, &value) in mean.iter_mut().zip(row) {
+            *sum += value / 196.;
+        }
+    }
+    assert_eq!(means[0].as_ref(), mean);
+    let masks = vec![0; 3 * 196];
+    let descriptors = model.descriptors(&pixels, &masks)?;
+    assert_eq!(descriptors.len(), 3 * 2 * M::HIDDEN);
+    for row in descriptors.chunks(2 * M::HIDDEN) {
+        assert!(row[M::HIDDEN..].iter().all(|&x| x == 0.));
+    }
+    assert!(model.forward(&[])?.is_empty());
+    assert!(model.descriptors(&[], &[])?.is_empty());
+    assert!(model.describe_rgb(&[], &[])?.is_empty());
+    Ok(())
+}
+#[test]
+#[ignore = "requires pretrained weights and gfx1151"]
+fn family_reference_vits() -> Result<()> {
+    family_reference_and_outputs::<ViTS16>()
+}
+#[test]
+#[ignore = "requires pretrained weights and gfx1151"]
+fn family_reference_vitl() -> Result<()> {
+    family_reference_and_outputs::<ViTL16>()
+}
+#[test]
+#[ignore = "requires pretrained weights and gfx1151"]
+fn family_reference_vith() -> Result<()> {
+    family_reference_and_outputs::<ViTH16Plus>()
+}
+#[test]
+#[ignore = "requires 7B checkpoint, substantial RAM and gfx1151"]
+fn family_reference_vit7b() -> Result<()> {
+    family_reference_and_outputs::<ViT7B16>()
+}
+
+#[test]
+fn rejects_gated_small_checkpoint_for_plain_small_model() -> Result<()> {
+    use safetensors::{Dtype, tensor::TensorView};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("model.safetensors");
+    let data = [0u8; 4];
+    let gate = TensorView::new(Dtype::F32, vec![1], &data)?;
+    std::fs::write(
+        &path,
+        safetensors::serialize([("layer.0.mlp.gate_proj.weight", gate)], None)?,
+    )?;
+    let error = DINOv3ViTS::load(&path, Options::default()).err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("gated MLP, but vits16 expects GELU"),
+        "{error}"
+    );
     Ok(())
 }

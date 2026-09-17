@@ -1,0 +1,71 @@
+// Rotate Q/K in F32 before narrowing; V and prefix tokens are only narrowed.
+amdgpu.target<gfx11-generic> @rope128_target {subgroup_size = 32}
+config.decl @dinov3.rope_f32_to_f16.hidden_size : %value: index where [range(%value,4096,4096)]
+kernel.def target(@rope128_target) export("dinov3_rope_f32_to_f16") @dinov3_rope_f32_to_f16(%rows:index) {
+ %one=index.constant 1 : index
+ %three=index.constant 3 : index
+ %threads=index.constant 256 : index
+ %extra=index.constant 255 : index
+ %h=config.get @dinov3.rope_f32_to_f16.hidden_size : index
+ %stride=index.mul %h,%three : index
+ %count=index.mul %rows,%stride : index
+ %rounded=index.add %count,%extra : index
+ %grid=index.div %rounded,%threads : index
+ kernel.launch.config workgroups(%grid,%one,%one) workgroup_size(%threads,%one,%one) : index
+} launch(%rows:index,%input:buffer,%cos:buffer,%sin:buffer,%output:buffer) {
+ %off=index.constant 0 : offset
+ %zero=index.constant 0 : index
+ %two=index.constant 2 : index
+ %three=index.constant 3 : index
+ %five=index.constant 5 : index
+ %half=index.constant 64 : index
+ %head=index.constant 128 : index
+ %patches=index.constant 196 : index
+ %tokens=index.constant 201 : index
+ %threads=index.constant 256 : index
+ %h=config.get @dinov3.rope_f32_to_f16.hidden_size : index
+ %stride=index.mul %h,%three : index
+ %rope_channels=index.mul %h,%two : index
+ %count=index.mul %rows,%stride : index
+ %group=kernel.workgroup.id<x> : index
+ %lane=kernel.workitem.id<x> : index
+ %base=index.mul %group,%threads : index
+ %raw=index.add %base,%lane : index
+ %valid=index.cmp ult,%raw,%count : index
+ scf.if %valid {
+  %i=index.assume %raw [lt(%raw,%count)] : index
+  %row=index.div %i,%stride : index
+  %channel=index.rem %i,%stride : index
+  %local=index.rem %row,%tokens : index
+  %past=index.cmp uge,%local,%five : index
+  %qk=index.cmp ult,%channel,%rope_channels : index
+  %rotate=scalar.andi %past,%qk : i1
+  %iv=buffer.view %input[%off] : buffer -> view<[%count]xf32>
+  %ov=buffer.view %output[%off] : buffer -> view<[%count]xf16>
+  %v=view.load %iv[%i] : view<[%count]xf32> -> f32
+  %result=scf.if %rotate -> (f32) {
+   %c=index.rem %channel,%head : index
+   %low=index.cmp ult,%c,%half : index
+   %up=index.add %i,%half : index
+   %down=index.sub %i,%half : index
+   %partner0=scf.select %low,%up,%down : index
+   // At most 64 images * 201 tokens * 12288 channels; pairs stay in each head.
+   %partner=index.assume %partner0 [range(%partner0,0,158072831), lt(%partner0,%count)] : index
+   %other=view.load %iv[%partner] : view<[%count]xf32> -> f32
+   %neg=scalar.negf %other : f32
+   %term=scf.select %low,%neg,%other : f32
+   %patch0=index.sub %local,%five : index
+   %patch=index.assume %patch0 [range(%patch0,0,195)] : index
+   %cv=buffer.view %cos[%off] : buffer -> view<196x128xf32>
+   %sv=buffer.view %sin[%off] : buffer -> view<196x128xf32>
+   %cosine=view.load %cv[%patch,%c] : view<196x128xf32> -> f32
+   %sine=view.load %sv[%patch,%c] : view<196x128xf32> -> f32
+   %scaled=scalar.mulf %v,%cosine : f32
+   %rotated=scalar.fmaf %term,%sine,%scaled : f32
+   scf.yield %rotated : f32
+  } else { scf.yield %v : f32 }
+  %narrow=scalar.fptrunc %result : f32 to f16
+  view.store %narrow,%ov[%i] : f16,view<[%count]xf16>
+ }
+ kernel.return
+}
