@@ -1,4 +1,4 @@
-//! Compare token/descriptor API latency and readback volume, excluding preparation.
+//! Compare token/descriptor latency, throughput, and readback, excluding preparation.
 use anyhow::{Result, ensure};
 use clap::Parser;
 use dinov3_hrx::{
@@ -84,7 +84,8 @@ fn run<M: ModelSpec>(args: Args) -> Result<()> {
     println!(
         "{}",
         serde_json::json!({"variant":M::NAME,"mode":mode,"batch":batch,"samples":samples,
-        "median_ms":times[samples/2],"p95_ms":times[(samples*95).div_ceil(100)-1],
+        "median_ms":times[samples/2],"images_per_second":(batch*samples) as f64*1000./times.iter().sum::<f64>(),
+        "ms_per_image":times[samples/2]/batch as f64,"p95_ms":times[(samples*95).div_ceil(100)-1],
         "download_bytes_per_call":(after.downloaded_bytes-before.downloaded_bytes)/samples as u64,
         "warm_ms":times})
     );

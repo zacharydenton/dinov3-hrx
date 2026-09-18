@@ -81,6 +81,68 @@ and non-finite inputs return errors. Inference methods use shared access with
 bounded reusable execution slots.
 GPU failures invalidate the session.
 
+## Embedded-token encoder
+
+`EncoderSpec` is unsealed and contains only architecture constants. Implement it
+in a downstream crate to use `Encoder<S>` without DINOv3 checkpoint metadata or
+image preprocessing. `ModelSpec: EncoderSpec` remains the sealed description of
+the supported DINOv3 checkpoints; `NAME`, `REPO`, `REVISION`, `SHARDED`, and `Row`
+stay there. Import `EncoderSpec` when accessing architecture constants directly
+on marker types, e.g. `ViTL16::LAYERS`.
+
+```rust
+use dinov3_hrx::{Encoder, EncoderOptions, EncoderSpec, EncoderWeights};
+use hrx::{execution::Graph, inference::ModelContext, tensor::DeviceTensor};
+
+struct Custom;
+impl EncoderSpec for Custom {
+    const HIDDEN: usize = 512;
+    const HEADS: usize = 8;
+    const LAYERS: usize = 6;
+    const INTERMEDIATE: usize = 2048;
+    const GATED: bool = false;
+}
+
+fn record_custom(
+    context: &ModelContext, graph: &mut Graph,
+    embedded: &DeviceTensor, weights: EncoderWeights,
+) -> anyhow::Result<DeviceTensor> {
+    let encoder = Encoder::<Custom>::new(context, EncoderOptions {
+        tokens_per_sequence: 257, max_batch: 16, ..Default::default()
+    }, weights)?;
+    encoder.record(graph, embedded)
+}
+```
+
+`EncoderWeights` contains typed `EncoderLayerWeights`, a final `NormWeights`, and
+optional `RotaryEmbedding` tables. Matrices are row-major F16 `[output,input]`;
+biases, LayerNorm, and LayerScale parameters are F32. Concatenate Q/K/V matrices
+in that order and gate/up matrices in that order for SwiGLU. Q/V biases must be
+zero when `QV_BIAS` is false; explicit encoder weights may include K biases. LayerScale vectors of
+ones disable scaling. Omit rotary tables when positions are already embedded.
+
+`record` takes contiguous `[batch,tokens,HIDDEN]` tokens in F16, or F32 when
+`RESIDUAL_F32` is true, and returns F32 tokens of the same shape. It records the
+pre-normalized attention and FFN stack plus final LayerNorm into the supplied
+`Graph`. Input is preserved with a device copy recorded in that graph; no inference
+is submitted. Graphs retain weights and code after the encoder is dropped.
+`DINOv3Model::encoder()` exposes the same resident encoder used by image inference.
+
+Current kernel limits are HIDDEN multiples of 128 from 128 through 4096,
+HEAD_DIM 64 or 128, INTERMEDIATE multiples of 256 from 256 through 8192, and
+1–256 layers. Sequences contain 1–1024 tokens, with 0–64 prefix tokens excluded
+from RoPE. Encoder batches may contain up to 1024 sequences. Checked allocation
+sizes must fit `EncoderOptions::max_workspace_bytes` (2 GiB by default), including
+residuals, QKV padding, FFN activations, output, and projection/split-K scratch.
+The budget applies per recorded graph and excludes weights and caller input.
+The attention capacity including padding must fit 1,048,576 tokens, and individual
+regions must fit the kernel's 32-bit byte-address range. For example, width 384
+with 1024 sequences of 32 tokens and an intermediate width of 1536 fits a 512 MiB
+workspace budget. DINOv3's image API keeps its existing 1–64 image batch contract.
+Attention is bidirectional
+within each sequence, without causal or padding masks. Unsupported dimensions,
+invalid weights, and mismatched input tensors return errors.
+
 ## Weights
 
 Pretrained constructors use Meta's LVD-1689M checkpoints, pinned independently:
@@ -125,11 +187,13 @@ cargo run --release --example bench_descriptors -- rgb 4 100 --variant vitb16
 ```
 
 `--variant` selects a compiled model type once at startup; local weights must
-match it. Benchmark JSON includes the selected variant.
+match it. Benchmark JSON includes the selected variant, `ms_per_image` derived
+from median batch latency, and `images_per_second` over all timed calls.
 
 Add `--benchmark 100` to measure warm end-to-end inference. Benchmark input must
 fit one resident batch. Timings use synchronized host clocks; see the
 [full-family validation and measurements](docs/vit-families-2026-09-17.md),
+[large-model projection optimization](docs/large-models-2026-09-18.md),
 [ViT-B comparison](docs/vitb-2026-09-17.md), and
 [earlier measurements](docs/optimization-2026-09-10.md).
 

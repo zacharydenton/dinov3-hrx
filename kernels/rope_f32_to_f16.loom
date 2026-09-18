@@ -1,6 +1,10 @@
 // Rotate Q/K in F32 before narrowing; V and prefix tokens are only narrowed.
 amdgpu.target<gfx11-generic> @rope128_target {subgroup_size = 32}
-config.decl @dinov3.rope_f32_to_f16.hidden_size : %value: index where [range(%value,4096,4096)]
+config.decl @dinov3.rope_f32_to_f16.hidden_size : %value: index where [range(%value,128,4096), mul(%value,64)]
+config.decl @dinov3.rope_f32_to_f16.head_dim : %value: index where [range(%value,64,128), mul(%value,64)]
+config.decl @dinov3.rope_f32_to_f16.tokens_per_image : %value: index where [range(%value,1,1024)]
+config.decl @dinov3.rope_f32_to_f16.prefix : %value: index where [range(%value,0,64)]
+config.decl @dinov3.rope_f32_to_f16.max_rows : %value: index where [range(%value,1,1048560)]
 kernel.def target(@rope128_target) export("dinov3_rope_f32_to_f16") @dinov3_rope_f32_to_f16(%rows:index) {
  %one=index.constant 1 : index
  %three=index.constant 3 : index
@@ -9,6 +13,8 @@ kernel.def target(@rope128_target) export("dinov3_rope_f32_to_f16") @dinov3_rope
  %h=config.get @dinov3.rope_f32_to_f16.hidden_size : index
  %stride=index.mul %h,%three : index
  %count=index.mul %rows,%stride : index
+ %max_rows=config.get @dinov3.rope_f32_to_f16.max_rows : index
+ %capacity=index.mul %max_rows,%stride : index
  %rounded=index.add %count,%extra : index
  %grid=index.div %rounded,%threads : index
  kernel.launch.config workgroups(%grid,%one,%one) workgroup_size(%threads,%one,%one) : index
@@ -17,16 +23,18 @@ kernel.def target(@rope128_target) export("dinov3_rope_f32_to_f16") @dinov3_rope
  %zero=index.constant 0 : index
  %two=index.constant 2 : index
  %three=index.constant 3 : index
- %five=index.constant 5 : index
- %half=index.constant 64 : index
- %head=index.constant 128 : index
- %patches=index.constant 196 : index
- %tokens=index.constant 201 : index
+ %five=config.get @dinov3.rope_f32_to_f16.prefix : index
+ %head=config.get @dinov3.rope_f32_to_f16.head_dim : index
+ %half=index.div %head,%two : index
+ %tokens=config.get @dinov3.rope_f32_to_f16.tokens_per_image : index
+ %patches=index.sub %tokens,%five : index
  %threads=index.constant 256 : index
  %h=config.get @dinov3.rope_f32_to_f16.hidden_size : index
  %stride=index.mul %h,%three : index
  %rope_channels=index.mul %h,%two : index
  %count=index.mul %rows,%stride : index
+ %max_rows=config.get @dinov3.rope_f32_to_f16.max_rows : index
+ %capacity=index.mul %max_rows,%stride : index
  %group=kernel.workgroup.id<x> : index
  %lane=kernel.workitem.id<x> : index
  %base=index.mul %group,%threads : index
@@ -49,17 +57,17 @@ kernel.def target(@rope128_target) export("dinov3_rope_f32_to_f16") @dinov3_rope
    %up=index.add %i,%half : index
    %down=index.sub %i,%half : index
    %partner0=scf.select %low,%up,%down : index
-   // At most 64 images * 201 tokens * 12288 channels; pairs stay in each head.
-   %partner=index.assume %partner0 [range(%partner0,0,158072831), lt(%partner0,%count)] : index
+   // Pairs stay inside a head; max_rows bounds the flattened F32 allocation.
+   %partner=index.assume %partner0 [range(%partner0,0,1073741823), lt(%partner0,%capacity), lt(%partner0,%count)] : index
    %other=view.load %iv[%partner] : view<[%count]xf32> -> f32
    %neg=scalar.negf %other : f32
    %term=scf.select %low,%neg,%other : f32
    %patch0=index.sub %local,%five : index
-   %patch=index.assume %patch0 [range(%patch0,0,195)] : index
-   %cv=buffer.view %cos[%off] : buffer -> view<196x128xf32>
-   %sv=buffer.view %sin[%off] : buffer -> view<196x128xf32>
-   %cosine=view.load %cv[%patch,%c] : view<196x128xf32> -> f32
-   %sine=view.load %sv[%patch,%c] : view<196x128xf32> -> f32
+   %patch=index.assume %patch0 [range(%patch0,0,1023), lt(%patch0,%patches)] : index
+   %cv=buffer.view %cos[%off] : buffer -> view<[%patches]x[%head]xf32>
+   %sv=buffer.view %sin[%off] : buffer -> view<[%patches]x[%head]xf32>
+   %cosine=view.load %cv[%patch,%c] : view<[%patches]x[%head]xf32> -> f32
+   %sine=view.load %sv[%patch,%c] : view<[%patches]x[%head]xf32> -> f32
    %scaled=scalar.mulf %v,%cosine : f32
    %rotated=scalar.fmaf %term,%sine,%scaled : f32
    scf.yield %rotated : f32

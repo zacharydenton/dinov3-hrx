@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.0 — 2026-09-18
+
+- Split the unsealed architecture-only `EncoderSpec` from DINOv3 checkpoint
+  metadata in `ModelSpec`. Direct architecture-constant access on marker types
+  now requires importing `EncoderSpec`.
+- Expose `Encoder<S>` with typed weights, sequence/RoPE options, and recording
+  into caller-owned HRX graphs. DINOv3 uses the same stack and exposes it through
+  `model.encoder()`; existing image inference and output types are retained.
+- Use 128×128 projection tiles for ViT-H+ and 256×64 for ViT-7B, sharing F32
+  projection scratch between QKV/RoPE and gated MLPs. Keep ViT-L's released
+  projection path after batch-16 measurements found no useful gain.
+- Extend numerical checks to downstream encoder specifications, graph input
+  preservation/lifetimes, projection epilogues, split-K tails, RoPE, and SwiGLU.
+- Bound encoder capacity by checked workspace bytes instead of DINOv3 token
+  counts; accept up to 1024 sequences, including taste’s 1024×32×384 shape.
+- Report images/second and milliseconds/image in descriptor benchmarks.
+
 ## 0.1.0 — 2026-09-18
 
 - Require published HRX 0.7.1 for reusable private graph scratch.

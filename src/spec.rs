@@ -3,19 +3,29 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// A supported architecture. Sealed so tensor and kernel contracts stay consistent.
-pub trait ModelSpec: sealed::Sealed + Send + Sync + 'static {
-    const NAME: &'static str;
+/// Architecture of a pre-normalized transformer encoder.
+///
+/// Downstream crates may implement this trait without checkpoint metadata.
+/// [`crate::Encoder`] validates the supported kernel dimensions before loading.
+pub trait EncoderSpec: Send + Sync + 'static {
     const HIDDEN: usize;
     const HEADS: usize;
-    const HEAD_DIM: usize = Self::HIDDEN / Self::HEADS;
-    /// Large models contain register-token residuals outside the finite F16 range.
+    const HEAD_DIM: usize = match Self::HIDDEN.checked_div(Self::HEADS) {
+        Some(width) => width,
+        None => 0,
+    };
+    /// Preserve residual values outside the finite F16 range.
     const RESIDUAL_F32: bool = Self::HIDDEN >= 1024;
     const QV_BIAS: bool = true;
-    const SHARDED: bool = false;
     const LAYERS: usize = 12;
     const INTERMEDIATE: usize;
     const GATED: bool;
+}
+
+/// A supported DINOv3 checkpoint and its statically sized output row.
+pub trait ModelSpec: EncoderSpec + sealed::Sealed {
+    const NAME: &'static str;
+    const SHARDED: bool = false;
     const REPO: &'static str;
     const REVISION: &'static str;
     /// One unnormalized CLS or patch-mean row, with a statically known width.
@@ -28,22 +38,26 @@ pub enum ViTS16Plus {}
 pub enum ViTB16 {}
 impl sealed::Sealed for ViTS16Plus {}
 impl sealed::Sealed for ViTB16 {}
-impl ModelSpec for ViTS16Plus {
-    const NAME: &'static str = "vits16plus";
+impl EncoderSpec for ViTS16Plus {
     const HIDDEN: usize = 384;
     const HEADS: usize = 6;
     const INTERMEDIATE: usize = 1536;
     const GATED: bool = true;
+}
+impl ModelSpec for ViTS16Plus {
+    const NAME: &'static str = "vits16plus";
     const REPO: &'static str = "dinov3-vits16plus-pretrain-lvd1689m";
     const REVISION: &'static str = "c93d816fc9e567563bc068f01475bec89cc634a6";
     type Row = [f32; 384];
 }
-impl ModelSpec for ViTB16 {
-    const NAME: &'static str = "vitb16";
+impl EncoderSpec for ViTB16 {
     const HIDDEN: usize = 768;
     const HEADS: usize = 12;
     const INTERMEDIATE: usize = 3072;
     const GATED: bool = false;
+}
+impl ModelSpec for ViTB16 {
+    const NAME: &'static str = "vitb16";
     const REPO: &'static str = "dinov3-vitb16-pretrain-lvd1689m";
     const REVISION: &'static str = "5931719e67bbdb9737e363e781fb0c67687896bc";
     type Row = [f32; 768];
@@ -52,14 +66,16 @@ impl ModelSpec for ViTB16 {
 /// DINOv3 vits16 architecture with 384-feature outputs.
 pub enum ViTS16 {}
 impl sealed::Sealed for ViTS16 {}
-impl ModelSpec for ViTS16 {
-    const NAME: &'static str = "vits16";
+impl EncoderSpec for ViTS16 {
     const HIDDEN: usize = 384;
     const HEADS: usize = 6;
     const LAYERS: usize = 12;
     const INTERMEDIATE: usize = 1536;
     const GATED: bool = false;
     const QV_BIAS: bool = true;
+}
+impl ModelSpec for ViTS16 {
+    const NAME: &'static str = "vits16";
     const SHARDED: bool = false;
     const REPO: &'static str = "dinov3-vits16-pretrain-lvd1689m";
     const REVISION: &'static str = "114c1379950215c8b35dfcd4e90a5c251dde0d32";
@@ -69,14 +85,16 @@ impl ModelSpec for ViTS16 {
 /// DINOv3 vitl16 architecture with 1024-feature outputs.
 pub enum ViTL16 {}
 impl sealed::Sealed for ViTL16 {}
-impl ModelSpec for ViTL16 {
-    const NAME: &'static str = "vitl16";
+impl EncoderSpec for ViTL16 {
     const HIDDEN: usize = 1024;
     const HEADS: usize = 16;
     const LAYERS: usize = 24;
     const INTERMEDIATE: usize = 4096;
     const GATED: bool = false;
     const QV_BIAS: bool = true;
+}
+impl ModelSpec for ViTL16 {
+    const NAME: &'static str = "vitl16";
     const SHARDED: bool = false;
     const REPO: &'static str = "dinov3-vitl16-pretrain-lvd1689m";
     const REVISION: &'static str = "ea8dc2863c51be0a264bab82070e3e8836b02d51";
@@ -86,14 +104,16 @@ impl ModelSpec for ViTL16 {
 /// DINOv3 vith16plus architecture with 1280-feature outputs.
 pub enum ViTH16Plus {}
 impl sealed::Sealed for ViTH16Plus {}
-impl ModelSpec for ViTH16Plus {
-    const NAME: &'static str = "vith16plus";
+impl EncoderSpec for ViTH16Plus {
     const HIDDEN: usize = 1280;
     const HEADS: usize = 20;
     const LAYERS: usize = 32;
     const INTERMEDIATE: usize = 5120;
     const GATED: bool = true;
     const QV_BIAS: bool = true;
+}
+impl ModelSpec for ViTH16Plus {
+    const NAME: &'static str = "vith16plus";
     const SHARDED: bool = false;
     const REPO: &'static str = "dinov3-vith16plus-pretrain-lvd1689m";
     const REVISION: &'static str = "c807c9eeea853df70aec4069e6f56b28ddc82acc";
@@ -103,14 +123,16 @@ impl ModelSpec for ViTH16Plus {
 /// DINOv3 vit7b16 architecture with 4096-feature outputs.
 pub enum ViT7B16 {}
 impl sealed::Sealed for ViT7B16 {}
-impl ModelSpec for ViT7B16 {
-    const NAME: &'static str = "vit7b16";
+impl EncoderSpec for ViT7B16 {
     const HIDDEN: usize = 4096;
     const HEADS: usize = 32;
     const LAYERS: usize = 40;
     const INTERMEDIATE: usize = 8192;
     const GATED: bool = true;
     const QV_BIAS: bool = false;
+}
+impl ModelSpec for ViT7B16 {
+    const NAME: &'static str = "vit7b16";
     const SHARDED: bool = true;
     const REPO: &'static str = "dinov3-vit7b16-pretrain-lvd1689m";
     const REVISION: &'static str = "b80367753773648a6793235ab9c65cdbb029506f";

@@ -5,7 +5,7 @@ config.decl @dinov3.attention_online_f16_wmma_h128.hidden_size : %value: index w
 
 config.decl @dinov3.attention_online_f16_wmma_h128.qkv_stride : %value: index where [range(%value, 64, 32768), mul(%value, 64)]
 
-config.decl @dinov3.attention_online_f16_wmma_h128.tokens_per_image : %value: index where [range(%value, 16, 8192)]
+config.decl @dinov3.attention_online_f16_wmma_h128.tokens_per_image : %value: index where [range(%value, 1, 8192)]
 
 config.decl @dinov3.attention_online_f16_wmma_h128.max_images : %value: index where [range(%value, 1, 1024)]
 

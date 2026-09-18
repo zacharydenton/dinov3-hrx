@@ -45,6 +45,7 @@ kernel.def target(@dinov3_matmul_qkv_rope_gfx11) export("dinov3_matmul_qkv_rope_
   %head_dim = config.get @dinov3.matmul_qkv_rope_f16_wmma.head_dim : index
   %prefix = config.get @dinov3.matmul_qkv_rope_f16_wmma.prefix : index
   %tokens_per_image = config.get @dinov3.matmul_qkv_rope_f16_wmma.tokens_per_image : index
+  %positions = index.sub %tokens_per_image, %prefix : index
   %rope_channels = config.get @dinov3.matmul_qkv_rope_f16_wmma.rope_channels : index
 
   %c0 = index.constant 0 : index
@@ -119,8 +120,8 @@ kernel.def target(@dinov3_matmul_qkv_rope_gfx11) export("dinov3_matmul_qkv_rope_
   %partner_row_base = index.mul %partner, %c16 : index
   %cos_global = buffer.assume.memory_space<global> %cos : buffer
   %sin_global = buffer.assume.memory_space<global> %sin : buffer
-  %cos_view = buffer.view %cos_global[%c0_offset] : buffer -> view<[%m_size]x[%head_dim]xf32>
-  %sin_view = buffer.view %sin_global[%c0_offset] : buffer -> view<[%m_size]x[%head_dim]xf32>
+  %cos_view = buffer.view %cos_global[%c0_offset] : buffer -> view<[%positions]x[%head_dim]xf32>
+  %sin_view = buffer.view %sin_global[%c0_offset] : buffer -> view<[%positions]x[%head_dim]xf32>
   %rotates_tile = index.cmp ult, %base_n, %rope_channels : index
 
   %load_packet = index.rem %workitem, %c4 : index
@@ -206,9 +207,9 @@ kernel.def target(@dinov3_matmul_qkv_rope_gfx11) export("dinov3_matmul_qkv_rope_
           %other = vector.load %flat_view[%partner_row, %publish_col] : view<128x16xf32> -> vector<4xf32>
           %other_biased = vector.addf %other, %partner_bias : vector<4xf32>
           %position0 = index.sub %in_image, %prefix : index
-          %position = index.assume %position0 [lt(%position0, %m_size)] : index
-          %cos_values = vector.load %cos_view[%position, %out_col_local] : view<[%m_size]x[%head_dim]xf32> -> vector<4xf32>
-          %sin_values = vector.load %sin_view[%position, %out_col_local] : view<[%m_size]x[%head_dim]xf32> -> vector<4xf32>
+          %position = index.assume %position0 [lt(%position0, %positions)] : index
+          %cos_values = vector.load %cos_view[%position, %out_col_local] : view<[%positions]x[%head_dim]xf32> -> vector<4xf32>
+          %sin_values = vector.load %sin_view[%position, %out_col_local] : view<[%positions]x[%head_dim]xf32> -> vector<4xf32>
           %scaled = vector.mulf %biased, %cos_values : vector<4xf32>
           // low:  low*cos - high*sin      high: high*cos + low*sin
           %negated = vector.negf %other_biased : vector<4xf32>

@@ -1,6 +1,11 @@
 //! DINOv3 ViT inference at 224×224, specialized by model type.
 //! Inputs are normalized RGB NCHW; outputs are tokens or compact descriptors.
 mod checkpoint;
+mod encoder;
+pub use encoder::{
+    Encoder, EncoderLayerWeights, EncoderOptions, EncoderWeights, LinearWeights, NormWeights,
+    RotaryEmbedding,
+};
 pub mod hub;
 mod pooling;
 mod preprocess;
@@ -17,7 +22,7 @@ use hrx::{
     plan_cache::PlanCache,
     tensor::{DType, DeviceTensor, Layout, TensorDesc},
 };
-pub use spec::{ModelSpec, ViT7B16, ViTB16, ViTH16Plus, ViTL16, ViTS16, ViTS16Plus};
+pub use spec::{EncoderSpec, ModelSpec, ViT7B16, ViTB16, ViTH16Plus, ViTL16, ViTS16, ViTS16Plus};
 use std::marker::PhantomData;
 use std::{collections::HashMap, path::Path};
 
@@ -43,6 +48,7 @@ impl Default for Options {
 pub struct DINOv3Model<M: ModelSpec> {
     marker: PhantomData<M>,
     engine: ModelDefinition,
+    encoder: Encoder<M>,
     plans: PlanCache<(usize, bool, bool), PreparedModel>,
     pooling: PlanCache<usize, PreparedModel>,
     summaries: PlanCache<(usize, bool), PreparedModel>,
@@ -104,7 +110,7 @@ impl<M: ModelSpec> DINOv3Model<M> {
         Self::from_packed(packed, context, max_batch)
     }
     fn from_packed(
-        packed: HashMap<String, Vec<u8>>,
+        mut packed: HashMap<String, Vec<u8>>,
         context: &ModelContext,
         max_batch: usize,
     ) -> Result<Self> {
@@ -118,20 +124,37 @@ impl<M: ModelSpec> DINOv3Model<M> {
         );
         let mut engine = ModelSession::in_context(context)?;
         let mut weights = HashMap::new();
-        for (name, bytes) in packed {
-            weights.insert(name, engine.weight(&bytes)?);
+        for name in ["patch_w", "patch_b", "prefix"] {
+            weights.insert(
+                name.to_owned(),
+                engine.weight(&packed.remove(name).expect("validated checkpoint"))?,
+            );
         }
-        let sizes = buffer_sizes::<M>(options.max_batch);
+        let encoder = Encoder::<M>::from_packed(
+            packed,
+            context,
+            EncoderOptions {
+                max_batch,
+                prefix_tokens: 5,
+                ..Default::default()
+            },
+        )?;
+        let sizes = [
+            max_batch * 196 * 768 * 4,
+            max_batch * 196 * M::HIDDEN * 4,
+            max_batch * TOKENS * M::HIDDEN * if M::RESIDUAL_F32 { 4 } else { 2 },
+        ];
         let a = sizes
             .into_iter()
             .map(|n| engine.allocate(n))
             .collect::<std::result::Result<_, _>>()?;
         // Every source is embedded in this crate and its bindings are declared below.
-        let kernels = unsafe { engine.compile(&specifications::<M>())? };
+        let kernels = unsafe { engine.compile(&embedding_specifications::<M>())? };
         let engine = engine.freeze(context)?;
         Ok(Self {
             marker: PhantomData,
             engine,
+            encoder,
             plans: PlanCache::new(8, PreparedModel::is_idle)?,
             pooling: PlanCache::new(8, PreparedModel::is_idle)?,
             summaries: PlanCache::new(8, PreparedModel::is_idle)?,
@@ -146,6 +169,11 @@ impl<M: ModelSpec> DINOv3Model<M> {
     pub fn context(&self) -> &ModelContext {
         self.engine.context()
     }
+    /// The resident encoder, usable with already embedded tokens in caller graphs.
+    pub fn encoder(&self) -> &Encoder<M> {
+        &self.encoder
+    }
+
     /// Pool resident tokens to normalized CLS and masked patch-mean descriptors.
     /// Mask is U8 `[batch,196]`, nonzero selects a patch. Empty masks produce a
     /// zero mean descriptor. Only `[batch,2,M::HIDDEN]` descriptors need downloading.
@@ -341,7 +369,8 @@ impl<M: ModelSpec> DINOv3Model<M> {
             .images
             .patchify_fragment(desc, 16)?
             .record(graph, std::slice::from_ref(pixels))?;
-        Ok(model.record(graph, &patches)?.remove(0))
+        let embedded = model.record(graph, &patches)?.remove(0);
+        self.encoder.record_owned(graph, embedded)
     }
 
     /// Record normalization (for U8 NHWC RGB), patchification, transformer and
@@ -369,7 +398,8 @@ impl<M: ModelSpec> DINOv3Model<M> {
             );
             let patches = preprocess::fragment(self.context(), batch)?
                 .record(graph, std::slice::from_ref(pixels))?;
-            self.fragment(batch)?.record(graph, &patches)?.remove(0)
+            let embedded = self.fragment(batch)?.record(graph, &patches)?.remove(0);
+            self.encoder.record_owned(graph, embedded)?
         } else {
             self.record(graph, pixels)?
         };
@@ -430,189 +460,35 @@ impl<M: ModelSpec> DINOv3Model<M> {
             (1..=self.options.max_batch).contains(&b),
             "invalid batch size"
         );
-        let r = (b * 201) as u32;
-        let p = (b * 196) as u32;
-        let sizes = buffer_sizes::<M>(b);
-        let shaped = self
-            .a
-            .iter()
-            .zip(sizes)
-            .map(|(&region, bytes)| region.slice(0, bytes))
-            .collect::<hrx::Result<Vec<_>>>()?;
-        let [x, h, q, attn, act, out, patched, image, partials, raw_qkv]: [Region; 10] =
-            shaped.try_into().unwrap();
-        let w = |s: &str| self.weights[s];
-        let mut commands = vec![Command::Fill {
-            region: q.slice(r as usize * (3 * M::HIDDEN) * 2, 16 * (3 * M::HIDDEN) * 2)?,
-            value: 0,
-        }];
-        let mut add = |kernel: usize,
-                       scalar: u32,
-                       grid: [u32; 3],
-                       bindings: Vec<Region>,
-                       output: Region,
-                       reads_output: bool| {
-            let bindings = bindings
-                .into_iter()
-                .map(|region| {
-                    if region == output {
-                        if reads_output {
-                            region.read_write()
-                        } else {
-                            region.write()
-                        }
-                    } else {
-                        region.read()
-                    }
-                })
-                .collect();
-            commands.push(Command::Dispatch(Dispatch::indices(
-                self.kernels[kernel],
-                [scalar],
-                grid,
-                bindings,
-            )));
-        };
-        add(
-            0,
-            p,
-            [(M::HIDDEN / 64) as u32, p.div_ceil(64), 1],
-            vec![image, w("patch_w"), w("patch_b"), patched],
-            patched,
-            false,
-        );
-        add(1, r, [r, 1, 1], vec![patched, w("prefix"), x], x, false);
-        add(
-            2,
-            r,
-            [r.div_ceil(8), 1, 1],
-            vec![x, w("l0_norm1_w"), w("l0_norm1_b"), h],
-            h,
-            false,
-        );
-        for i in 0..M::LAYERS {
-            let s = format!("l{i}_");
-            let wt = |suffix: &str| w(&(s.clone() + suffix));
-            if M::HEAD_DIM == 64 {
-                add(
-                    4,
-                    r,
-                    [(3 * M::HIDDEN / 64) as u32, r.div_ceil(64), 1],
-                    vec![h, wt("qkv_w"), wt("qkv_b"), q, w("rope_cos"), w("rope_sin")],
-                    q,
-                    false,
-                );
-            } else {
-                add(
-                    4,
-                    r,
-                    [(3 * M::HIDDEN / 64) as u32, r.div_ceil(64), 1],
-                    vec![h, wt("qkv_w"), wt("qkv_b"), raw_qkv],
-                    raw_qkv,
-                    false,
-                );
-                add(
-                    11,
-                    r,
-                    [(r as usize * 3 * M::HIDDEN).div_ceil(256) as u32, 1, 1],
-                    vec![raw_qkv, w("rope_cos"), w("rope_sin"), q],
-                    q,
-                    false,
-                );
-            }
-            let k = q.slice(M::HIDDEN * 2, q.len() - M::HIDDEN * 2)?;
-            let v = q.slice(M::HIDDEN * 4, q.len() - M::HIDDEN * 4)?;
-            add(
-                5,
-                r,
-                [(b * 13) as u32, M::HEADS as u32, 1],
-                vec![q, k, v, attn],
-                attn,
-                false,
-            );
-            add(
-                6,
-                r,
-                [(M::HIDDEN / 64) as u32, r.div_ceil(64), 1],
-                vec![attn, wt("o_w"), wt("o_b"), x, wt("ls1")],
-                x,
-                true,
-            );
-            add(
-                2,
-                r,
-                [r.div_ceil(8), 1, 1],
-                vec![x, wt("norm2_w"), wt("norm2_b"), h],
-                h,
-                false,
-            );
-            add(
-                8,
-                r,
-                [(M::INTERMEDIATE / 64) as u32, r.div_ceil(64), 1],
+        let p = b * 196;
+        let r = b * TOKENS;
+        let image = self.a[0].slice(0, p * 768 * 4)?;
+        let patched = self.a[1].slice(0, p * M::HIDDEN * 4)?;
+        let embedded = self.a[2].slice(0, r * M::HIDDEN * if M::RESIDUAL_F32 { 4 } else { 2 })?;
+        let commands = [
+            Command::Dispatch(Dispatch::indices(
+                self.kernels[0],
+                [p as u32],
+                [(M::HIDDEN / 64) as u32, p.div_ceil(64) as u32, 1],
                 vec![
-                    h,
-                    wt(if M::GATED { "gateup_w" } else { "up_w" }),
-                    wt(if M::GATED { "gateup_b" } else { "up_b" }),
-                    act,
+                    image.read(),
+                    self.weights["patch_w"].read(),
+                    self.weights["patch_b"].read(),
+                    patched.write(),
                 ],
-                act,
-                false,
-            );
-            if b == 1 {
-                add(
-                    9,
-                    r,
-                    [(M::HIDDEN / 64) as u32, r.div_ceil(64), 4],
-                    vec![act, wt("down_w"), wt("down_b"), partials],
-                    partials,
-                    false,
-                );
-                add(
-                    10,
-                    r,
-                    [r, 1, 1],
-                    vec![partials, wt("down_b"), x, wt("ls2")],
-                    x,
-                    true,
-                );
-            } else {
-                add(
-                    7,
-                    r,
-                    [(M::HIDDEN / 64) as u32, r.div_ceil(64), 1],
-                    vec![act, wt("down_w"), wt("down_b"), x, wt("ls2")],
-                    x,
-                    true,
-                );
-            }
-            if i + 1 < M::LAYERS {
-                add(
-                    2,
-                    r,
-                    [r.div_ceil(8), 1, 1],
-                    vec![
-                        x,
-                        w(&format!("l{}_norm1_w", i + 1)),
-                        w(&format!("l{}_norm1_b", i + 1)),
-                        h,
-                    ],
-                    h,
-                    false,
-                );
-            }
-        }
-        add(
-            3,
-            r,
-            [r.div_ceil(8), 1, 1],
-            vec![x, w("norm_w"), w("norm_b"), out],
-            out,
-            false,
-        );
-        // The embedded kernels obey the scalar, region and access contracts above.
-        // Every private activation is written before use; QKV padding is filled
-        // above. Residual and split-K paths need no initial scratch contents.
+            )),
+            Command::Dispatch(Dispatch::indices(
+                self.kernels[1],
+                [r as u32],
+                [r as u32, 1, 1],
+                vec![
+                    patched.read(),
+                    self.weights["prefix"].read(),
+                    embedded.write(),
+                ],
+            )),
+        ];
+        // Fixed 224x224 patch geometry; embedding kernels initialize every output.
         unsafe {
             Ok(self
                 .engine
@@ -620,8 +496,8 @@ impl<M: ModelSpec> DINOv3Model<M> {
                     &commands,
                     &[(image, TensorDesc::new(DType::F32, vec![b, 196, 768])?)],
                     &[(
-                        out,
-                        TensorDesc::new(DType::F32, vec![b, TOKENS, M::HIDDEN])?,
+                        embedded,
+                        TensorDesc::new(Encoder::<M>::input_dtype(), vec![b, TOKENS, M::HIDDEN])?,
                     )],
                 )?
                 .reuse_private_scratch())
@@ -645,30 +521,7 @@ fn patchify(input: &[f32], out: &mut [f32]) {
         }
     }
 }
-// Residuals are F32 for large models to preserve register-token outliers.
-// Normalized input, QKV, attention and MLP activations are F16.
-// Final tokens, patch embeddings, image patches and split-K partials are F32.
-fn buffer_sizes<M: ModelSpec>(batch: usize) -> [usize; 10] {
-    let rows = batch * TOKENS;
-    let patches = batch * 196;
-    [
-        rows * M::HIDDEN * if M::RESIDUAL_F32 { 4 } else { 2 },
-        rows * M::HIDDEN * 2,
-        (rows + 16) * 3 * M::HIDDEN * 2,
-        rows * M::HIDDEN * 2,
-        rows * M::INTERMEDIATE * 2,
-        rows * M::HIDDEN * 4,
-        patches * M::HIDDEN * 4,
-        patches * 768 * 4,
-        4 * TOKENS * M::HIDDEN * 4,
-        if M::HEAD_DIM == 128 {
-            rows * 3 * M::HIDDEN * 4
-        } else {
-            4
-        },
-    ]
-}
-fn specifications<M: ModelSpec>() -> Vec<(&'static str, Specialization)> {
+fn embedding_specifications<M: ModelSpec>() -> Vec<(&'static str, Specialization)> {
     let mut s = vec![];
     macro_rules! spec { ($file:literal,$ns:literal,[$($k:literal => $v:expr),*]) => {{
         let mut spec=Specialization::new(concat!("dinov3_",$ns));
@@ -681,45 +534,16 @@ fn specifications<M: ModelSpec>() -> Vec<(&'static str, Specialization)> {
     } else {
         spec!("embed_scatter_f32","embed_scatter_f32",["hidden_size"=>M::HIDDEN,"tokens_per_image"=>201,"prefix"=>5]);
     }
-    if M::HIDDEN == 384 {
-        spec!("layernorm_rowwave_f16","layernorm_rowwave_f16",["hidden_size"=>M::HIDDEN,"epsilon"=>"1e-5"]);
-        spec!("layernorm_rowwave_f32out","layernorm_rowwave_f32out",["hidden_size"=>M::HIDDEN,"epsilon"=>"1e-5"]);
-    } else if M::HIDDEN == 768 {
-        spec!("layernorm_rowwave_768_f16","layernorm_rowwave_768_f16",["hidden_size"=>M::HIDDEN,"epsilon"=>"1e-5"]);
-        spec!("layernorm_rowwave_768_f32out","layernorm_rowwave_768_f32out",["hidden_size"=>M::HIDDEN,"epsilon"=>"1e-5"]);
-    }
-    if M::HIDDEN > 768 {
-        spec!("layernorm_rowwave_wide_f16","layernorm_rowwave_wide_f16",["hidden_size"=>M::HIDDEN,"epsilon"=>"1e-5"]);
-        spec!("layernorm_rowwave_wide_f32out","layernorm_rowwave_wide_f32out",["hidden_size"=>M::HIDDEN,"epsilon"=>"1e-5"]);
-    }
-    if M::HEAD_DIM == 64 {
-        spec!("matmul_qkv_rope_f16_wmma","matmul_qkv_rope_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>3*M::HIDDEN,"head_dim"=>64,"prefix"=>5,"tokens_per_image"=>201,"rope_channels"=>2*M::HIDDEN]);
-        spec!("attention_online_f16_wmma_cf16","attention_online_f16_wmma_cf16",["hidden_size"=>M::HIDDEN,"qkv_stride"=>3*M::HIDDEN,"tokens_per_image"=>201,"scale"=>0.125,"max_images"=>64,"token_capacity"=>262144]);
-    } else {
-        spec!("matmul_qkv_f32out","matmul_qkv_f32out",["k_size"=>M::HIDDEN,"n_size"=>3*M::HIDDEN]);
-        spec!("attention_online_f16_wmma_h128","attention_online_f16_wmma_h128",["hidden_size"=>M::HIDDEN,"qkv_stride"=>3*M::HIDDEN,"tokens_per_image"=>201,"scale"=>1.0_f64/128.0_f64.sqrt(),"max_images"=>64,"token_capacity"=>16384]);
-    }
-    if M::RESIDUAL_F32 {
-        spec!("matmul_resid_f32_wmma","matmul_resid_f32_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::HIDDEN]);
-        spec!("matmul_resid_f32_wmma","matmul_resid_f32_wmma",["k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN]);
-    } else {
-        spec!("matmul_resid_f16_wmma","matmul_resid_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::HIDDEN]);
-        spec!("matmul_resid_f16_wmma","matmul_resid_f16_wmma",["k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN]);
-    }
-    if M::GATED {
-        spec!("matmul_swiglu_f16_wmma","matmul_swiglu_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::INTERMEDIATE]);
-    } else {
-        spec!("matmul_gelu_f16_wmma","matmul_gelu_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::INTERMEDIATE]);
-    }
-    spec!("matmul_splitk_f16_wmma","matmul_splitk_f16_wmma",["k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN,"splits"=>4]);
-    if M::RESIDUAL_F32 {
-        spec!("splitk_reduce_f32","splitk_reduce_f32",["n_size"=>M::HIDDEN,"splits"=>4]);
-    } else {
-        spec!("splitk_reduce_f16","splitk_reduce_f16",["n_size"=>M::HIDDEN,"splits"=>4]);
-    }
-    if M::HEAD_DIM == 128 {
-        spec!("rope_f32_to_f16","rope_f32_to_f16",["hidden_size"=>M::HIDDEN]);
-    }
+    s
+}
+#[cfg(test)]
+fn specifications<M: ModelSpec>() -> Vec<(&'static str, Specialization)> {
+    let mut s = embedding_specifications::<M>();
+    s.extend(encoder::specifications::<M>(EncoderOptions {
+        prefix_tokens: 5,
+        max_batch: 64,
+        ..Default::default()
+    }));
     s
 }
 
@@ -729,14 +553,13 @@ mod tests {
     #[test]
     fn buffer_extents_preserve_patch_width_and_qkv_padding() {
         for batch in [1, 3, 64] {
-            let small = buffer_sizes::<ViTS16Plus>(batch);
-            let base = buffer_sizes::<ViTB16>(batch);
-            assert_eq!(base[7], small[7]); // RGB patch input is architecture-independent.
-            for i in [0, 1, 2, 3, 4, 5, 6, 8] {
+            let small = encoder::buffer_sizes::<ViTS16Plus>(batch, TOKENS).unwrap();
+            let base = encoder::buffer_sizes::<ViTB16>(batch, TOKENS).unwrap();
+            for i in [0, 1, 2, 3, 4, 5, 6] {
                 assert_eq!(base[i], 2 * small[i]);
             }
             assert_eq!(base[2] - batch * TOKENS * 2304 * 2, 16 * 2304 * 2);
-            assert_eq!(base[8], 4 * TOKENS * 768 * 4);
+            assert_eq!(base[6], 4 * TOKENS * 768 * 4);
         }
     }
     #[test]

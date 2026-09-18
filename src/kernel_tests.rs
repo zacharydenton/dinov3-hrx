@@ -306,21 +306,24 @@ fn attention_128_matches_reference_across_heads_and_image_tails() -> Result<()> 
     Ok(())
 }
 
-#[test]
-#[ignore = "requires gfx1151 and Loom"]
-fn rope_128_preserves_prefix_and_value_channels() -> Result<()> {
+fn check_rope<M: ModelSpec>() -> Result<()> {
+    let head = M::HEAD_DIM;
     let rows = 2 * TOKENS;
-    let stride = 3 * 4096;
+    let stride = 3 * M::HIDDEN;
     let input: Vec<f32> = (0..rows * stride)
         .map(|i| ((i * 7 % 127) as f32 - 63.) / 17.)
         .collect();
     let mut cos = Vec::new();
     let mut sin = Vec::new();
     for p in 0..196 {
-        for c in 0..128 {
-            let pos = if c % 64 < 32 { p / 14 } else { p % 14 };
+        for c in 0..head {
+            let pos = if c % (head / 2) < head / 4 {
+                p / 14
+            } else {
+                p % 14
+            };
             let angle = 2. * std::f64::consts::PI * (2. * (pos as f64 + 0.5) / 14. - 1.)
-                / 100f64.powf((c % 32) as f64 / 32.);
+                / 100f64.powf((c % (head / 4)) as f64 / (head / 4) as f64);
             cos.push(angle.cos() as f32);
             sin.push(angle.sin() as f32);
         }
@@ -333,7 +336,18 @@ fn rope_128_preserves_prefix_and_value_channels() -> Result<()> {
     let out = model.allocate(output_desc.bytes())?;
     let cos_region = model.weight(bytemuck::cast_slice(&cos))?;
     let sin_region = model.weight(bytemuck::cast_slice(&sin))?;
-    let kernel = unsafe { model.compile(&[specifications::<ViT7B16>()[11].clone()])? }[0];
+    let mut spec = Specialization::new("dinov3_rope_f32_to_f16");
+    for (name, value) in [
+        ("hidden_size", M::HIDDEN),
+        ("max_rows", rows),
+        ("head_dim", M::HEAD_DIM),
+        ("tokens_per_image", 201),
+        ("prefix", 5),
+    ] {
+        spec.set_config(format!("dinov3.rope_f32_to_f16.{name}"), value.to_string());
+    }
+    let kernel =
+        unsafe { model.compile(&[(include_str!("../kernels/rope_f32_to_f16.loom"), spec)])? }[0];
     let commands = [Command::Dispatch(Dispatch::indices(
         kernel,
         [rows as u32],
@@ -355,14 +369,14 @@ fn rope_128_preserves_prefix_and_value_channels() -> Result<()> {
         let row = i / stride;
         let c = i % stride;
         let local = row % TOKENS;
-        let expected = if local >= 5 && c < 8192 {
-            let channel = c % 128;
-            let other = if channel < 64 {
-                -input[i + 64]
+        let expected = if local >= 5 && c < 2 * M::HIDDEN {
+            let channel = c % head;
+            let other = if channel < head / 2 {
+                -input[i + head / 2]
             } else {
-                input[i - 64]
+                input[i - head / 2]
             };
-            let offset = (local - 5) * 128 + channel;
+            let offset = (local - 5) * head + channel;
             other.mul_add(sin[offset], input[i] * cos[offset])
         } else {
             input[i]
@@ -373,6 +387,185 @@ fn rope_128_preserves_prefix_and_value_channels() -> Result<()> {
             f16::from_f32(expected).to_f32(),
             "row {row} channel {c}"
         );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires gfx1151 and Loom"]
+fn rope_preserves_prefix_and_value_channels_for_both_head_widths() -> Result<()> {
+    check_rope::<ViTL16>()?;
+    check_rope::<ViTH16Plus>()?;
+    check_rope::<ViT7B16>()
+}
+
+#[test]
+#[ignore = "requires gfx1151 and Loom"]
+fn wide_projection_epilogues_and_splitk_match_reference() -> Result<()> {
+    let (k, n) = (256usize, 128usize);
+    for (rows, tile_rows) in [
+        (273, 128),
+        (273, 256),
+        (64 * TOKENS, 128),
+        (64 * TOKENS, 256),
+        (32768, 128),
+        (32768, 256),
+    ] {
+        let input: Vec<_> = (0..rows * k)
+            .map(|i| f16::from_f32(((i * 17 % 71) as f32 - 35.) / 64.))
+            .collect();
+        let weights: Vec<_> = (0..n * k)
+            .map(|i| f16::from_f32(((i * 13 % 67) as f32 - 33.) / 128.))
+            .collect();
+        let biases: Vec<_> = (0..n).map(|i| (i as f32 - 64.) / 128.).collect();
+        let scales = vec![0.125f32; n];
+        for (epilogue, splits) in [(0, 1), (1, 1), (2, 1), (0, 4)] {
+            let context = ModelContext::new(Default::default())?;
+            let mut model = ModelSession::in_context(&context)?;
+            let x = model.weight(bytemuck::cast_slice(&input))?;
+            let w = model.weight(bytemuck::cast_slice(&weights))?;
+            let bias = model.weight(bytemuck::cast_slice(&biases))?;
+            let scale = model.weight(bytemuck::cast_slice(&scales))?;
+            let prior: Vec<_> = (0..rows * n * splits)
+                .map(|i| {
+                    if i % 13 == 0 {
+                        100_000f32
+                    } else {
+                        (i % 31) as f32 / 32.
+                    }
+                })
+                .collect();
+            let output_bytes = rows * n * splits * if epilogue == 1 { 2 } else { 4 };
+            let out = model.allocate(output_bytes + 256)?;
+            let mut initial = vec![0xa5u8; output_bytes + 256];
+            if epilogue == 2 {
+                initial[..output_bytes].copy_from_slice(bytemuck::cast_slice(&prior));
+            }
+            model.upload(out, &initial)?;
+            let mut spec = Specialization::new("dinov3_matmul_wide_wmma");
+            for (key, value) in [
+                ("tile_rows", tile_rows),
+                ("max_rows", rows),
+                ("k_size", k),
+                ("n_size", n),
+                ("splits", splits),
+                ("epilogue", epilogue),
+            ] {
+                spec.set_config(format!("dinov3.matmul_wide_wmma.{key}"), value.to_string());
+            }
+            let kernel = unsafe {
+                model.compile(&[(include_str!("../kernels/matmul_wide_wmma.loom"), spec)])?
+            }[0];
+            unsafe {
+                model.record(
+                    0,
+                    &[Command::Dispatch(Dispatch::indices(
+                        kernel,
+                        [rows as u32],
+                        [
+                            (n / (16384 / tile_rows)) as u32,
+                            rows.div_ceil(tile_rows) as u32,
+                            splits as u32,
+                        ],
+                        vec![
+                            x.read(),
+                            w.read(),
+                            bias.read(),
+                            if epilogue == 2 {
+                                out.read_write()
+                            } else {
+                                out.write()
+                            },
+                            scale.read(),
+                        ],
+                    ))],
+                )?;
+            }
+            model.replay(0)?;
+            model.synchronize()?;
+            let mut bytes = vec![0; output_bytes + 256];
+            model.read(out, &mut bytes)?;
+            assert!(
+                bytes[output_bytes..].iter().all(|&x| x == 0xa5),
+                "wrote past output tail"
+            );
+            for split in 0..splits {
+                for row in 0..rows {
+                    if rows > 273 && ![0, 255, 256, 12799, 12800, rows - 1].contains(&row) {
+                        continue;
+                    }
+                    for col in 0..n {
+                        let sum: f64 = (split * k / splits..(split + 1) * k / splits)
+                            .map(|j| input[row * k + j].to_f64() * weights[col * k + j].to_f64())
+                            .sum();
+                        let index = (split * rows + row) * n + col;
+                        let expected = if splits > 1 {
+                            sum as f32
+                        } else {
+                            let biased = sum as f32 + biases[col];
+                            match epilogue {
+                                1 => f16::from_f32(
+                                    (0.5 * biased as f64
+                                        * (1.
+                                            + libm::erf(biased as f64 / std::f64::consts::SQRT_2)))
+                                        as f32,
+                                )
+                                .to_f32(),
+                                2 => prior[index] + biased * scales[col],
+                                _ => biased,
+                            }
+                        };
+                        let actual = if epilogue == 1 {
+                            f16::from_le_bytes(bytes[index * 2..index * 2 + 2].try_into().unwrap())
+                                .to_f32()
+                        } else {
+                            f32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+                        };
+                        let tolerance = if epilogue == 1 {
+                            0.001 * expected.abs().max(1.)
+                        } else {
+                            1e-5 * expected.abs().max(1.)
+                        };
+                        assert!(
+                            (actual - expected).abs() < tolerance,
+                            "epilogue={epilogue} splits={splits} row={row} col={col}: {actual} != {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires gfx1151 and Loom"]
+fn projected_swiglu_matches_f32_reference_before_narrowing() -> Result<()> {
+    let rows = 3;
+    let width = ViT7B16::INTERMEDIATE;
+    let input: Vec<_> = (0..rows * 2 * width)
+        .map(|i| ((i * 17 % 1021) as f32 - 510.) / 32.)
+        .collect();
+    let actual = run_kernel_bytes::<ViT7B16>(
+        12,
+        bytemuck::cast_slice(&input),
+        DType::F32,
+        vec![rows, 2 * width],
+        &[],
+        TensorDesc::new(DType::F16, vec![rows, width])?,
+        [(rows * width).div_ceil(1024) as u32, 1, 1],
+    )?;
+    for row in 0..rows {
+        for col in 0..width {
+            let gate = input[row * 2 * width + col];
+            let up = input[row * 2 * width + width + col];
+            let expected = f16::from_f32(gate / (1. + (-gate).exp()) * up).to_f32();
+            let value = actual[row * width + col];
+            assert!(
+                (value - expected).abs() <= 0.001 * expected.abs().max(1.),
+                "row {row} col {col}: {value} != {expected}"
+            );
+        }
     }
     Ok(())
 }

@@ -1,0 +1,54 @@
+// Finish the two F32 projections without narrowing before SiLU/multiplication.
+amdgpu.target<gfx11-generic> @target {subgroup_size = 32}
+config.decl @dinov3.swiglu_f32_to_f16.width : %value: index where [range(%value,256,8192),mul(%value,64)]
+config.decl @dinov3.swiglu_f32_to_f16.max_rows : %value: index where [range(%value,1,1048560)]
+kernel.def target(@target) export("dinov3_swiglu_f32_to_f16") @dinov3_swiglu_f32_to_f16(%rows:index) {
+ %one=index.constant 1 : index
+ %threads=index.constant 256 : index
+ %tile=index.constant 1024 : index
+ %extra=index.constant 1023 : index
+ %width=config.get @dinov3.swiglu_f32_to_f16.width : index
+ %count=index.mul %rows,%width : index
+ %max_rows=config.get @dinov3.swiglu_f32_to_f16.max_rows : index
+ %capacity=index.mul %max_rows,%width : index
+ %round=index.add %count,%extra : index
+ %grid=index.div %round,%tile : index
+ kernel.launch.config workgroups(%grid,%one,%one) workgroup_size(%threads,%one,%one) : index
+} launch(%rows:index,%input:buffer,%output:buffer) {
+ %off=index.constant 0 : offset
+ %two=index.constant 2 : index
+ %four=index.constant 4 : index
+ %tile=index.constant 1024 : index
+ %width=config.get @dinov3.swiglu_f32_to_f16.width : index
+ %stride=index.mul %width,%two : index
+ %count=index.mul %rows,%width : index
+ %max_rows=config.get @dinov3.swiglu_f32_to_f16.max_rows : index
+ %capacity=index.mul %max_rows,%width : index
+ %group=kernel.workgroup.id<x> : index
+ %lane=kernel.workitem.id<x> : index
+ %base=index.mul %group,%tile : index
+ %channel=index.mul %lane,%four : index
+ %raw=index.add %base,%channel : index
+ %limit=index.sub %count,%four : index
+ %valid=index.cmp ule,%raw,%limit : index
+ scf.if %valid {
+  %i=index.assume %raw [range(%raw,0,536870911), lt(%raw,%capacity), le(%raw,%limit)] : index
+  %row0=index.div %i,%width : index
+  %row=index.assume %row0 [lt(%row0,%rows)] : index
+  %column0=index.rem %i,%width : index
+  %column_limit=index.sub %width,%four : index
+  %column=index.assume %column0 [le(%column0,%column_limit)] : index
+  %up_column0=index.add %column,%width : index
+  %up_limit=index.sub %stride,%four : index
+  %up_column=index.assume %up_column0 [le(%up_column0,%up_limit)] : index
+  %iv=buffer.view %input[%off] : buffer -> view<[%rows]x[%stride]xf32>
+  %ov=buffer.view %output[%off] : buffer -> view<[%count]xf16>
+  %gate=vector.load %iv[%row,%column] : view<[%rows]x[%stride]xf32> -> vector<4xf32>
+  %up=vector.load %iv[%row,%up_column] : view<[%rows]x[%stride]xf32> -> vector<4xf32>
+  %activated=vector.siluf<afn> %gate : vector<4xf32>
+  %product=vector.mulf %activated,%up : vector<4xf32>
+  %narrow=vector.fptrunc %product : vector<4xf32> to vector<4xf16>
+  vector.store %narrow,%ov[%i] : vector<4xf16>,view<[%count]xf16>
+ }
+ kernel.return
+}
