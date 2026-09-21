@@ -12,6 +12,8 @@ config.decl @dinov3.matmul_qkv_f32out.k_size : %value: index where [range(%value
 
 config.decl @dinov3.matmul_qkv_f32out.n_size : %value: index where [range(%value, 64, 16384), mul(%value, 64)]
 
+config.decl @dinov3.matmul_qkv_f32out.weight_stride : %value: index where [range(%value,64,16448),mul(%value,64)]
+
 kernel.def target(@dinov3_matmul_wmma_gfx11) export("dinov3_matmul_qkv_f32out") @dinov3_matmul_qkv_f32out(%m_size: index) {
   %c1 = index.constant 1 : index
   %c63 = index.constant 63 : index
@@ -23,6 +25,7 @@ kernel.def target(@dinov3_matmul_wmma_gfx11) export("dinov3_matmul_qkv_f32out") 
   %n_tiles = index.div %n_size0, %c64 : index
   kernel.launch.config workgroups(%n_tiles, %m_tiles, %c1) workgroup_size(%c256, %c1, %c1) : index
 } launch(%m_size: index, %a: buffer, %w: buffer, %bias: buffer, %c: buffer) {
+  %weight_stride = config.get @dinov3.matmul_qkv_f32out.weight_stride : index
   %k_size0 = config.get @dinov3.matmul_qkv_f32out.k_size : index
   %n_size0 = config.get @dinov3.matmul_qkv_f32out.n_size : index
   %k_size = index.assume %k_size0 [range(%k_size0, 64, 16384), mul(%k_size0, 64)] : index
@@ -68,7 +71,7 @@ kernel.def target(@dinov3_matmul_wmma_gfx11) export("dinov3_matmul_qkv_f32out") 
   %bias_global = buffer.assume.memory_space<global> %bias : buffer
   %c_global = buffer.assume.memory_space<global> %c : buffer
   %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_size]x[%k_size]xf16>
-  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_size]xf16>
+  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%weight_stride]xf16>
   %bias_view = buffer.view %bias_global[%c0_offset] : buffer -> view<[%n_size]xf32>
   %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_size]x[%n_size]xf32>
 
@@ -106,7 +109,7 @@ kernel.def target(@dinov3_matmul_wmma_gfx11) export("dinov3_matmul_qkv_f32out") 
     }
     vector.store %a_values, %a_stage_view[%row, %load_k] : vector<16xf16>, view<64x72xf16>
     %source_n = index.add %base_n, %row : index
-    %w_values = vector.load %w_view[%source_n, %source_k] : view<[%n_size]x[%k_size]xf16> -> vector<16xf16>
+    %w_values = vector.load %w_view[%source_n, %source_k] : view<[%n_size]x[%weight_stride]xf16> -> vector<16xf16>
     vector.store %w_values, %w_stage_view[%row, %load_k] : vector<16xf16>, view<64x72xf16>
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 

@@ -26,6 +26,10 @@ config.decl @dinov3.matmul_qkv_rope_f16_wmma.tokens_per_image : %value: index wh
 // Columns below this get rotated: q and k, not v.
 config.decl @dinov3.matmul_qkv_rope_f16_wmma.rope_channels : %value: index where [range(%value, 64, 32768), mul(%value, 64)]
 
+config.decl @dinov3.matmul_qkv_rope_f16_wmma.weight_stride : %value: index where [range(%value,64,16448),mul(%value,64)]
+
+config.decl @dinov3.matmul_qkv_rope_f16_wmma.output_stride : %value: index where [range(%value,64,32768),mul(%value,64)]
+
 kernel.def target(@dinov3_matmul_qkv_rope_gfx11) export("dinov3_matmul_qkv_rope_f16_wmma") @dinov3_matmul_qkv_rope_f16_wmma(%m_size: index) {
   %c1 = index.constant 1 : index
   %c63 = index.constant 63 : index
@@ -37,6 +41,8 @@ kernel.def target(@dinov3_matmul_qkv_rope_gfx11) export("dinov3_matmul_qkv_rope_
   %n_tiles = index.div %n_size0, %c64 : index
   kernel.launch.config workgroups(%n_tiles, %m_tiles, %c1) workgroup_size(%c256, %c1, %c1) : index
 } launch(%m_size: index, %a: buffer, %w: buffer, %bias: buffer, %c: buffer, %cos: buffer, %sin: buffer) {
+  %output_stride = config.get @dinov3.matmul_qkv_rope_f16_wmma.output_stride : index
+  %weight_stride = config.get @dinov3.matmul_qkv_rope_f16_wmma.weight_stride : index
   %k_size0 = config.get @dinov3.matmul_qkv_rope_f16_wmma.k_size : index
   %n_size0 = config.get @dinov3.matmul_qkv_rope_f16_wmma.n_size : index
   %k_size = index.assume %k_size0 [range(%k_size0, 64, 8192), mul(%k_size0, 64)] : index
@@ -88,9 +94,9 @@ kernel.def target(@dinov3_matmul_qkv_rope_gfx11) export("dinov3_matmul_qkv_rope_
   %bias_global = buffer.assume.memory_space<global> %bias : buffer
   %c_global = buffer.assume.memory_space<global> %c : buffer
   %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_size]x[%k_size]xf16>
-  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_size]xf16>
+  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%weight_stride]xf16>
   %bias_view = buffer.view %bias_global[%c0_offset] : buffer -> view<[%n_size]xf32>
-  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_size]x[%n_size]xf16>
+  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_size]x[%output_stride]xf16>
 
   // The final reduction-loop workgroup barrier retires both staging tiles.
   // Their 18 KiB allocation then holds eight disjoint 1 KiB result tiles.
@@ -146,7 +152,7 @@ kernel.def target(@dinov3_matmul_qkv_rope_gfx11) export("dinov3_matmul_qkv_rope_
     }
     vector.store %a_values, %a_stage_view[%row, %load_k] : vector<16xf16>, view<64x72xf16>
     %source_n = index.add %base_n, %row : index
-    %w_values = vector.load %w_view[%source_n, %source_k] : view<[%n_size]x[%k_size]xf16> -> vector<16xf16>
+    %w_values = vector.load %w_view[%source_n, %source_k] : view<[%n_size]x[%weight_stride]xf16> -> vector<16xf16>
     vector.store %w_values, %w_stage_view[%row, %load_k] : vector<16xf16>, view<64x72xf16>
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
@@ -220,7 +226,7 @@ kernel.def target(@dinov3_matmul_qkv_rope_gfx11) export("dinov3_matmul_qkv_rope_
           scf.yield %biased : vector<4xf32>
         }
         %narrow = vector.fptrunc %rotated : vector<4xf32> to vector<4xf16>
-        vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_size]x[%n_size]xf16>
+        vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_size]x[%output_stride]xf16>
       }
     }
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)

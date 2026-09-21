@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1 — 2026-09-21
+
+- Improve paired batch-16 RGB descriptor throughput by 1.39× for ViT-L and
+  1.83× for ViT-7B versus 0.2.0, with byte-identical outputs.
+- Pad power-of-two weight rows and QKV activation rows to reduce memory-access
+  conflicts on Radeon 8060S, improving ViT-L and ViT-7B throughput without
+  changing checkpoint formats or arithmetic.
+- Use 128×128 wide projection tiles with register prefetch and groups of four
+  row tiles for cache reuse. Preserve split-K behavior and the MMA reduction order;
+  retain H+’s released schedule after a measured prefetch regression.
+- Extend numerical checks to weight-padding canaries, QKV row padding, grouped
+  tile tails, and single-token downstream encoders.
+
 ## 0.2.0 — 2026-09-18
 
 - Split the unsealed architecture-only `EncoderSpec` from DINOv3 checkpoint

@@ -192,6 +192,7 @@ from median batch latency, and `images_per_second` over all timed calls.
 
 Add `--benchmark 100` to measure warm end-to-end inference. Benchmark input must
 fit one resident batch. Timings use synchronized host clocks; see the
+[memory-layout optimization](docs/memory-layout-2026-09-18.md),
 [full-family validation and measurements](docs/vit-families-2026-09-17.md),
 [large-model projection optimization](docs/large-models-2026-09-18.md),
 [ViT-B comparison](docs/vitb-2026-09-17.md), and

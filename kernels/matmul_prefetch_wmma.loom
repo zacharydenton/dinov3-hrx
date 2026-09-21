@@ -1,4 +1,6 @@
-// 128x128 or 256x64 output tile, with a 64-element reduction tile.
+// 128x128 output tile, 64-element reduction tile, and register prefetch.
+// Groups of four row tiles reuse weight tiles through cache. The last group
+// uses ordinary row-major ordering, so the launch needs no ghost workgroups.
 // Each wave reuses matrix fragments across eight output fragments.
 // epilogue: 0 = F32 projection/partials; 1 = F16 GELU; 2 = F32 residual.
 // Split-K writes unbiased F32 partials in separate row slabs.
@@ -10,15 +12,15 @@ config.decl @dinov3.matmul_wide_wmma.k_size : %value: index where [range(%value,
 config.decl @dinov3.matmul_wide_wmma.n_size : %value: index where [range(%value,64,16384),mul(%value,64)]
 config.decl @dinov3.matmul_wide_wmma.splits : %value: index where [range(%value,1,4)]
 config.decl @dinov3.matmul_wide_wmma.epilogue : %value: index where [range(%value,0,2)]
-config.decl @dinov3.matmul_wide_wmma.tile_rows : %value: index where [range(%value,128,256),mul(%value,128)]
 config.decl @dinov3.matmul_wide_wmma.max_rows : %value: index where [range(%value,1,1048560)]
 config.decl @dinov3.matmul_wide_wmma.weight_stride : %value: index where [range(%value,64,16448),mul(%value,64)]
+
 kernel.def target(@target) export("dinov3_matmul_wide_wmma") @dinov3_matmul_wide_wmma(%rows:index) {
  %one=index.constant 1 : index
  %threads=index.constant 256 : index
- %bm=config.get @dinov3.matmul_wide_wmma.tile_rows : index
+ %bm=index.constant 128 : index
  %area=index.constant 16384 : index
- %bn=index.div %area,%bm : index
+ %bn=index.constant 128 : index
  %extra=index.sub %bm,%one : index
  %n=config.get @dinov3.matmul_wide_wmma.n_size : index
  %round=index.add %rows,%extra : index
@@ -26,13 +28,15 @@ kernel.def target(@target) export("dinov3_matmul_wide_wmma") @dinov3_matmul_wide
  %gx=index.div %n,%bn : index
  %splits=config.get @dinov3.matmul_wide_wmma.splits : index
  kernel.launch.config workgroups(%gx,%gy,%splits) workgroup_size(%threads,%one,%one) : index
-} launch(%rows:index,%a:buffer,%w:buffer,%bias:buffer,%out:buffer,%lambda:buffer) {
+} launch(%row_count:index,%a:buffer,%w:buffer,%bias:buffer,%out:buffer,%lambda:buffer) {
+ %rows=index.assume %row_count [range(%row_count,1,1048560)] : index
  %ks=config.get @dinov3.matmul_wide_wmma.k_size : index
- %weight_stride=config.get @dinov3.matmul_wide_wmma.weight_stride : index
+ %w_stride=config.get @dinov3.matmul_wide_wmma.weight_stride : index
  %ns=config.get @dinov3.matmul_wide_wmma.n_size : index
  %splits=config.get @dinov3.matmul_wide_wmma.splits : index
  %epilogue=config.get @dinov3.matmul_wide_wmma.epilogue : index
- %split=kernel.workgroup.id<z> : index
+ %split0=kernel.workgroup.id<z> : index
+ %split=index.assume %split0 [range(%split0,0,3),lt(%split0,%splits)] : index
  %chunk=index.div %ks,%splits : index
  %k_start=index.mul %split,%chunk : index
  %out_rows=index.mul %rows,%splits : index
@@ -44,9 +48,9 @@ kernel.def target(@target) export("dinov3_matmul_wide_wmma") @dinov3_matmul_wide
  %four=index.constant 4 : index
  %eight=index.constant 8 : index
  %sixteen=index.constant 16 : index
- %bm=config.get @dinov3.matmul_wide_wmma.tile_rows : index
+ %bm=index.constant 128 : index
  %area=index.constant 16384 : index
- %bn=index.div %area,%bm : index
+ %bn=index.constant 128 : index
  %bk=index.constant 64 : index
  %stride=index.constant 72 : index
  %packet=index.constant 16 : index
@@ -64,8 +68,37 @@ kernel.def target(@target) export("dinov3_matmul_wide_wmma") @dinov3_matmul_wide
  %result_bytes=index.constant 1024 : offset
  %zero_f=vector.constant 0.0 : vector<8xf32>
  %zero_h=vector.constant 0.0 : vector<16xf16>
- %gx=kernel.workgroup.id<x> : index
- %gy=kernel.workgroup.id<y> : index
+ %wg_x=kernel.workgroup.id<x> : index
+ %wg_y=kernel.workgroup.id<y> : index
+ %raster_min=index.constant 512 : index
+ %raster_enough=index.cmp uge,%max_rows,%raster_min : index
+ %unsplit=index.cmp eq,%splits,%one : index
+ %rasterize=scalar.andi %raster_enough,%unsplit : i1
+ %gx,%gy=scf.if %rasterize -> (index,index) {
+ %raster=index.constant 4 : index
+ %n_tiles=index.div %ns,%bn : index
+ %m_extra=index.sub %bm,%one : index
+ %bounded_rows=index.assume %rows [range(%rows,1,1048560)] : index
+ %m_round=index.add %bounded_rows,%m_extra : index
+ %m_tiles=index.div %m_round,%bm : index
+ %linear0=index.mul %wg_y,%n_tiles : index
+ %linear_raw=index.add %linear0,%wg_x : index
+ %linear=index.assume %linear_raw [range(%linear_raw,0,268435455)] : index
+ %group_span=index.mul %n_tiles,%raster : index
+ %group=index.div %linear,%group_span : index
+ %group_m=index.mul %group,%raster : index
+ %group_end=index.add %group_m,%raster : index
+ %full_group=index.cmp ule,%group_end,%m_tiles : index
+ %in_group=index.rem %linear,%group_span : index
+ %m_in_group=index.rem %in_group,%raster : index
+ %mapped_y=index.add %group_m,%m_in_group : index
+ %mapped_x=index.div %in_group,%raster : index
+ %gy0=scf.select %full_group,%mapped_y,%wg_y : index
+ %mapped_gy=index.assume %gy0 [range(%gy0,0,65534)] : index
+ %gx0=scf.select %full_group,%mapped_x,%wg_x : index
+ %mapped_gx=index.assume %gx0 [lt(%gx0,%n_tiles)] : index
+ scf.yield %mapped_gx,%mapped_gy : index,index
+ } else { scf.yield %wg_x,%wg_y : index,index }
  %tid=kernel.workitem.id<x> : index
  %wave0=kernel.subgroup.id : index
  %wave=index.assume %wave0 [range(%wave0,0,7)] : index
@@ -80,10 +113,14 @@ kernel.def target(@target) export("dinov3_matmul_wide_wmma") @dinov3_matmul_wide
  %load_packet=index.rem %tid,%packets : index
  %load_k=index.mul %load_packet,%packet : index
  %av=buffer.view %a[%off] : buffer -> view<[%rows]x[%ks]xf16>
- %wv=buffer.view %w[%off] : buffer -> view<[%ns]x[%weight_stride]xf16>
+ %wv=buffer.view %w[%off] : buffer -> view<[%ns]x[%w_stride]xf16>
  %bv=buffer.view %bias[%off] : buffer -> view<[%ns]xf32>
- %ov=buffer.view %out[%off] : buffer -> view<[%out_rows]x[%ns]xf32>
- %ov_half=buffer.view %out[%off] : buffer -> view<[%rows]x[%ns]xf16>
+ %out_elements=index.mul %out_rows,%ns : index
+ %half_elements=index.mul %rows,%ns : index
+ %out_limit=index.sub %out_elements,%four : index
+ %half_limit=index.sub %half_elements,%four : index
+ %ov=buffer.view %out[%off] : buffer -> view<[%out_elements]xf32>
+ %ov_half=buffer.view %out[%off] : buffer -> view<[%half_elements]xf16>
  %lv=buffer.view %lambda[%off] : buffer -> view<[%ns]xf32>
  %is_gelu=index.cmp eq,%epilogue,%one : index
  %is_resid=index.cmp eq,%epilogue,%two : index
@@ -161,25 +198,58 @@ kernel.def target(@target) export("dinov3_matmul_wide_wmma") @dinov3_matmul_wide
  %init5=vector.fragment<init> %zero_f shape [%sixteen,%sixteen] : vector<8xf32>
  %init6=vector.fragment<init> %zero_f shape [%sixteen,%sixteen] : vector<8xf32>
  %init7=vector.fragment<init> %zero_f shape [%sixteen,%sixteen] : vector<8xf32>
- %acc0,%acc1,%acc2,%acc3,%acc4,%acc5,%acc6,%acc7=scf.for %kb=[%zero to %chunk step %bk](%run0=%init0 : vector<8xf32>,%run1=%init1 : vector<8xf32>,%run2=%init2 : vector<8xf32>,%run3=%init3 : vector<8xf32>,%run4=%init4 : vector<8xf32>,%run5=%init5 : vector<8xf32>,%run6=%init6 : vector<8xf32>,%run7=%init7 : vector<8xf32>) -> (vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>) {
- %src_k0=index.add %kb,%load_k : index
- %src_k=index.add %src_k0,%k_start : index
- scf.for %ar=[%load_row to %bm step %row_step] unroll {
-  %arow=index.add %base_m,%ar : index
-  %valid=index.cmp ult,%arow,%rows : index
-  %vals=scf.if %valid -> (vector<16xf16>) {
-   %bound=index.assume %arow [lt(%arow,%rows)] : index
-   %loaded=vector.load %av[%bound,%src_k] : view<[%rows]x[%ks]xf16> -> vector<16xf16>
-   scf.yield %loaded : vector<16xf16>
-  } else { scf.yield %zero_h : vector<16xf16> }
-  vector.store %vals,%as[%ar,%load_k] : vector<16xf16>,view<[%bm]x72xf16>
- }
- scf.for %wr=[%load_row to %bn step %row_step] unroll {
-  %wrow=index.add %base_n,%wr : index
-  %vals=vector.load %wv[%wrow,%src_k] : view<[%ns]x[%weight_stride]xf16> -> vector<16xf16>
-  vector.store %vals,%ws[%wr,%load_k] : vector<16xf16>,view<[%bn]x72xf16>
- }
+ %a0_offset=index.constant 0 : index
+ %a0_local=index.add %load_row,%a0_offset : index
+ %a0_row=index.add %base_m,%a0_local : index
+ %a0_valid=index.cmp ult,%a0_row,%rows : index
+ %a1_offset=index.constant 64 : index
+ %a1_local=index.add %load_row,%a1_offset : index
+ %a1_row=index.add %base_m,%a1_local : index
+ %a1_valid=index.cmp ult,%a1_row,%rows : index
+ %w0_offset=index.constant 0 : index
+ %w0_local=index.add %load_row,%w0_offset : index
+ %w0_row=index.add %base_n,%w0_local : index
+ %w1_offset=index.constant 64 : index
+ %w1_local=index.add %load_row,%w1_offset : index
+ %w1_row=index.add %base_n,%w1_local : index
+ %initial_k=index.add %k_start,%load_k : index
+ %initial_a0=scf.if %a0_valid -> (vector<16xf16>) {
+  %bound=index.assume %a0_row [lt(%a0_row,%rows)] : index
+  %loaded=vector.load %av[%bound,%initial_k] : view<[%rows]x[%ks]xf16> -> vector<16xf16>
+  scf.yield %loaded : vector<16xf16>
+ } else { scf.yield %zero_h : vector<16xf16> }
+ %initial_a1=scf.if %a1_valid -> (vector<16xf16>) {
+  %bound=index.assume %a1_row [lt(%a1_row,%rows)] : index
+  %loaded=vector.load %av[%bound,%initial_k] : view<[%rows]x[%ks]xf16> -> vector<16xf16>
+  scf.yield %loaded : vector<16xf16>
+ } else { scf.yield %zero_h : vector<16xf16> }
+ %initial_w0=vector.load %wv[%w0_row,%initial_k] : view<[%ns]x[%w_stride]xf16> -> vector<16xf16>
+ %initial_w1=vector.load %wv[%w1_row,%initial_k] : view<[%ns]x[%w_stride]xf16> -> vector<16xf16>
+ %acc0,%acc1,%acc2,%acc3,%acc4,%acc5,%acc6,%acc7,%unused_a0,%unused_a1,%unused_w0,%unused_w1=scf.for %kb=[%zero to %chunk step %bk](%run0=%init0 : vector<8xf32>,%run1=%init1 : vector<8xf32>,%run2=%init2 : vector<8xf32>,%run3=%init3 : vector<8xf32>,%run4=%init4 : vector<8xf32>,%run5=%init5 : vector<8xf32>,%run6=%init6 : vector<8xf32>,%run7=%init7 : vector<8xf32>,%current_a0=%initial_a0 : vector<16xf16>,%current_a1=%initial_a1 : vector<16xf16>,%current_w0=%initial_w0 : vector<16xf16>,%current_w1=%initial_w1 : vector<16xf16>) -> (vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<16xf16>,vector<16xf16>,vector<16xf16>,vector<16xf16>) {
+ vector.store %current_a0,%as[%a0_local,%load_k] : vector<16xf16>,view<[%bm]x72xf16>
+ vector.store %current_a1,%as[%a1_local,%load_k] : vector<16xf16>,view<[%bm]x72xf16>
+ vector.store %current_w0,%ws[%w0_local,%load_k] : vector<16xf16>,view<[%bn]x72xf16>
+ vector.store %current_w1,%ws[%w1_local,%load_k] : vector<16xf16>,view<[%bn]x72xf16>
  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+ %next_kb=index.add %kb,%bk : index
+ %has_next=index.cmp ult,%next_kb,%chunk : index
+ %safe_kb=scf.select %has_next,%next_kb,%zero : index
+ %next_k0=index.add %safe_kb,%load_k : index
+ %next_k_raw=index.add %next_k0,%k_start : index
+ %k_limit=index.sub %ks,%sixteen : index
+ %next_k=index.assume %next_k_raw [le(%next_k_raw,%k_limit),mul(%next_k_raw,16)] : index
+ %prefetch_a0=scf.if %a0_valid -> (vector<16xf16>) {
+  %bound=index.assume %a0_row [lt(%a0_row,%rows)] : index
+  %loaded=vector.load %av[%bound,%next_k] : view<[%rows]x[%ks]xf16> -> vector<16xf16>
+  scf.yield %loaded : vector<16xf16>
+ } else { scf.yield %zero_h : vector<16xf16> }
+ %prefetch_a1=scf.if %a1_valid -> (vector<16xf16>) {
+  %bound=index.assume %a1_row [lt(%a1_row,%rows)] : index
+  %loaded=vector.load %av[%bound,%next_k] : view<[%rows]x[%ks]xf16> -> vector<16xf16>
+  scf.yield %loaded : vector<16xf16>
+ } else { scf.yield %zero_h : vector<16xf16> }
+ %prefetch_w0=vector.load %wv[%w0_row,%next_k] : view<[%ns]x[%w_stride]xf16> -> vector<16xf16>
+ %prefetch_w1=vector.load %wv[%w1_row,%next_k] : view<[%ns]x[%w_stride]xf16> -> vector<16xf16>
  %next0,%next1,%next2,%next3,%next4,%next5,%next6,%next7=scf.for %kh=[%zero to %bk step %sixteen](%half0=%run0 : vector<8xf32>,%half1=%run1 : vector<8xf32>,%half2=%run2 : vector<8xf32>,%half3=%run3 : vector<8xf32>,%half4=%run4 : vector<8xf32>,%half5=%run5 : vector<8xf32>,%half6=%run6 : vector<8xf32>,%half7=%run7 : vector<8xf32>) -> (vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>) unroll {
   %lhs0=vector.fragment.load<lhs> %as[%mr0,%kh] shape [%sixteen,%sixteen] : view<[%bm]x72xf16> -> vector<16xf16>
   %rhs0=vector.fragment.load<rhs> %wf[%kh,%nc0] shape [%sixteen,%sixteen] : view<64x[%bn]xf16,%layout> -> vector<16xf16>
@@ -208,7 +278,7 @@ kernel.def target(@target) export("dinov3_matmul_wide_wmma") @dinov3_matmul_wide
   scf.yield %o0,%o1,%o2,%o3,%o4,%o5,%o6,%o7 : vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>
  }
  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
- scf.yield %next0,%next1,%next2,%next3,%next4,%next5,%next6,%next7 : vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>
+ scf.yield %next0,%next1,%next2,%next3,%next4,%next5,%next6,%next7,%prefetch_a0,%prefetch_a1,%prefetch_w0,%prefetch_w1 : vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<8xf32>,vector<16xf16>,vector<16xf16>,vector<16xf16>,vector<16xf16>
  }
  %pr0=index.div %lane,%four : index
  %pc0=index.rem %lane,%four : index
@@ -255,13 +325,16 @@ kernel.def target(@target) export("dinov3_matmul_wide_wmma") @dinov3_matmul_wide
   %row=index.add %base_m,%row0 : index
   %valid=index.cmp ult,%row,%rows : index
   scf.if %valid {
-   %bound=index.assume %row [lt(%row,%rows)] : index
+   %bound=index.assume %row [range(%row,0,1048559),lt(%row,%rows)] : index
    %v=vector.load %result[%pr,%pc] : view<16x16xf32> -> vector<4xf32>
    scf.if %is_gelu {
     %b=vector.addf %v,%bias_values : vector<4xf32>
     %act=vector.geluf<erf> %b : vector<4xf32>
     %narrow=vector.fptrunc %act : vector<4xf32> to vector<4xf16>
-    vector.store %narrow,%ov_half[%bound,%col] : vector<4xf16>,view<[%rows]x[%ns]xf16>
+    %half_base=index.mul %bound,%ns : index
+    %half_index0=index.add %half_base,%col : index
+    %half_index=index.assume %half_index0 [range(%half_index0,0,2147483643),mul(%half_index0,4),le(%half_index0,%half_limit)] : index
+    vector.store %narrow,%ov_half[%half_index] : vector<4xf16>,view<[%half_elements]xf16>
    } else {
     %value=scf.if %is_split -> (vector<4xf32>) {
      scf.yield %v : vector<4xf32>
@@ -271,14 +344,17 @@ kernel.def target(@target) export("dinov3_matmul_wide_wmma") @dinov3_matmul_wide
     }
     %outrow0=index.add %bound,%slab : index
     %outrow=index.assume %outrow0 [range(%outrow0,0,4194239), lt(%outrow0,%partial_capacity), lt(%outrow0,%out_rows)] : index
+    %out_base=index.mul %outrow,%ns : index
+    %out_index0=index.add %out_base,%col : index
+    %out_index=index.assume %out_index0 [range(%out_index0,0,1073741819),mul(%out_index0,4),le(%out_index0,%out_limit)] : index
     %updated=scf.if %is_resid -> (vector<4xf32>) {
-     %prior=vector.load %ov[%outrow,%col] : view<[%out_rows]x[%ns]xf32> -> vector<4xf32>
+     %prior=vector.load %ov[%out_index] : view<[%out_elements]xf32> -> vector<4xf32>
      %scale=vector.load %lv[%col] : view<[%ns]xf32> -> vector<4xf32>
      %scaled=vector.mulf %value,%scale : vector<4xf32>
      %sum=vector.addf %prior,%scaled : vector<4xf32>
      scf.yield %sum : vector<4xf32>
     } else { scf.yield %value : vector<4xf32> }
-    vector.store %updated,%ov[%outrow,%col] : vector<4xf32>,view<[%out_rows]x[%ns]xf32>
+    vector.store %updated,%ov[%out_index] : vector<4xf32>,view<[%out_elements]xf32>
    }
   }
  }

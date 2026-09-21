@@ -226,7 +226,7 @@ fn large_layernorm_widths_match_reference() -> Result<()> {
 fn attention_128_matches_reference_across_heads_and_image_tails() -> Result<()> {
     let h = 4096;
     let rows = 2 * TOKENS;
-    let stride = 3 * h;
+    let stride = encoder::qkv_stride::<ViT7B16>();
     let mut qkv = vec![f16::ZERO; (rows + 16) * stride];
     for t in 0..rows {
         for c in 0..h {
@@ -310,6 +310,7 @@ fn check_rope<M: ModelSpec>() -> Result<()> {
     let head = M::HEAD_DIM;
     let rows = 2 * TOKENS;
     let stride = 3 * M::HIDDEN;
+    let output_stride = encoder::qkv_stride::<M>();
     let input: Vec<f32> = (0..rows * stride)
         .map(|i| ((i * 7 % 127) as f32 - 63.) / 17.)
         .collect();
@@ -331,7 +332,7 @@ fn check_rope<M: ModelSpec>() -> Result<()> {
     let context = ModelContext::new(Default::default())?;
     let mut model = ModelSession::in_context(&context)?;
     let input_desc = TensorDesc::new(DType::F32, vec![rows, stride])?;
-    let output_desc = TensorDesc::new(DType::F16, vec![rows, stride])?;
+    let output_desc = TensorDesc::new(DType::F16, vec![rows, output_stride])?;
     let x = model.allocate(input_desc.bytes())?;
     let out = model.allocate(output_desc.bytes())?;
     let cos_region = model.weight(bytemuck::cast_slice(&cos))?;
@@ -340,6 +341,7 @@ fn check_rope<M: ModelSpec>() -> Result<()> {
     for (name, value) in [
         ("hidden_size", M::HIDDEN),
         ("max_rows", rows),
+        ("output_stride", output_stride),
         ("head_dim", M::HEAD_DIM),
         ("tokens_per_image", 201),
         ("prefix", 5),
@@ -348,12 +350,18 @@ fn check_rope<M: ModelSpec>() -> Result<()> {
     }
     let kernel =
         unsafe { model.compile(&[(include_str!("../kernels/rope_f32_to_f16.loom"), spec)])? }[0];
-    let commands = [Command::Dispatch(Dispatch::indices(
-        kernel,
-        [rows as u32],
-        [(rows * stride).div_ceil(256) as u32, 1, 1],
-        vec![x.read(), cos_region.read(), sin_region.read(), out.write()],
-    ))];
+    let commands = [
+        Command::Fill {
+            region: out,
+            value: 0xa5,
+        },
+        Command::Dispatch(Dispatch::indices(
+            kernel,
+            [rows as u32],
+            [(rows * stride).div_ceil(256) as u32, 1, 1],
+            vec![x.read(), cos_region.read(), sin_region.read(), out.write()],
+        )),
+    ];
     let fragment = unsafe {
         model
             .freeze(&context)?
@@ -365,9 +373,14 @@ fn check_rope<M: ModelSpec>() -> Result<()> {
         .download()?
         .wait()?
         .remove(0);
-    for (i, bytes) in bytes.as_chunks::<2>().0.iter().enumerate() {
-        let row = i / stride;
-        let c = i % stride;
+    for (out_i, bytes) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        let row = out_i / output_stride;
+        let c = out_i % output_stride;
+        if c >= stride {
+            assert_eq!(*bytes, [0xa5; 2], "overwrote QKV row padding");
+            continue;
+        }
+        let i = row * stride + c;
         let local = row % TOKENS;
         let expected = if local >= 5 && c < 2 * M::HIDDEN {
             let channel = c % head;
@@ -402,15 +415,18 @@ fn rope_preserves_prefix_and_value_channels_for_both_head_widths() -> Result<()>
 #[test]
 #[ignore = "requires gfx1151 and Loom"]
 fn wide_projection_epilogues_and_splitk_match_reference() -> Result<()> {
-    let (k, n) = (256usize, 128usize);
-    for (rows, tile_rows) in [
-        (273, 128),
-        (273, 256),
-        (64 * TOKENS, 128),
-        (64 * TOKENS, 256),
-        (32768, 128),
-        (32768, 256),
+    // Cover the prefetched final K tile, grouped scheduling plus its short
+    // final group, padded weights, and the downstream batch-1024 row extent.
+    let tile_rows = 128;
+    for (rows, k, n, padded) in [
+        (1usize, 256usize, 256usize, false),
+        (127, 256, 256, true),
+        (129, 256, 128, true),
+        (641, 1024, 256, true),
+        (64 * TOKENS, 256, 128, false),
+        (32768, 256, 128, true),
     ] {
+        let weight_stride = k + if padded { 64 } else { 0 };
         let input: Vec<_> = (0..rows * k)
             .map(|i| f16::from_f32(((i * 17 % 71) as f32 - 35.) / 64.))
             .collect();
@@ -423,7 +439,14 @@ fn wide_projection_epilogues_and_splitk_match_reference() -> Result<()> {
             let context = ModelContext::new(Default::default())?;
             let mut model = ModelSession::in_context(&context)?;
             let x = model.weight(bytemuck::cast_slice(&input))?;
-            let w = model.weight(bytemuck::cast_slice(&weights))?;
+            let mut packed = vec![f16::NAN; n * weight_stride];
+            for (src, dst) in weights
+                .chunks_exact(k)
+                .zip(packed.chunks_exact_mut(weight_stride))
+            {
+                dst[..k].copy_from_slice(src);
+            }
+            let w = model.weight(bytemuck::cast_slice(&packed))?;
             let bias = model.weight(bytemuck::cast_slice(&biases))?;
             let scale = model.weight(bytemuck::cast_slice(&scales))?;
             let prior: Vec<_> = (0..rows * n * splits)
@@ -444,7 +467,7 @@ fn wide_projection_epilogues_and_splitk_match_reference() -> Result<()> {
             model.upload(out, &initial)?;
             let mut spec = Specialization::new("dinov3_matmul_wide_wmma");
             for (key, value) in [
-                ("tile_rows", tile_rows),
+                ("weight_stride", weight_stride),
                 ("max_rows", rows),
                 ("k_size", k),
                 ("n_size", n),
@@ -454,7 +477,7 @@ fn wide_projection_epilogues_and_splitk_match_reference() -> Result<()> {
                 spec.set_config(format!("dinov3.matmul_wide_wmma.{key}"), value.to_string());
             }
             let kernel = unsafe {
-                model.compile(&[(include_str!("../kernels/matmul_wide_wmma.loom"), spec)])?
+                model.compile(&[(include_str!("../kernels/matmul_prefetch_wmma.loom"), spec)])?
             }[0];
             unsafe {
                 model.record(
@@ -491,7 +514,9 @@ fn wide_projection_epilogues_and_splitk_match_reference() -> Result<()> {
             );
             for split in 0..splits {
                 for row in 0..rows {
-                    if rows > 273 && ![0, 255, 256, 12799, 12800, rows - 1].contains(&row) {
+                    if rows > 273
+                        && ![0, 127, 128, 255, 256, 511, 512, 12799, 12800, rows - 1].contains(&row)
+                    {
                         continue;
                     }
                     for col in 0..n {

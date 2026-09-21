@@ -139,6 +139,21 @@ impl<S: EncoderSpec> Encoder<S> {
         let mut model = ModelSession::in_context(context)?;
         let mut weights = HashMap::new();
         for (name, bytes) in packed {
+            let k = if name.ends_with("_down_w") {
+                Some(S::INTERMEDIATE)
+            } else if ["_qkv_w", "_o_w", "_up_w", "_gateup_w"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+            {
+                Some(S::HIDDEN)
+            } else {
+                None
+            };
+            let bytes = if let Some(k) = k {
+                pad_weight_rows(bytes, k, weight_stride::<S>(k))
+            } else {
+                bytes
+            };
             weights.insert(name, model.weight(&bytes)?);
         }
         let a = buffer_sizes::<S>(options.max_batch, options.tokens_per_sequence)?
@@ -389,7 +404,10 @@ impl<S: EncoderSpec> Encoder<S> {
             shaped.try_into().unwrap();
         let w = |s: &str| self.weights[s];
         let mut commands = vec![Command::Fill {
-            region: q.slice(r as usize * (3 * S::HIDDEN) * 2, 16 * (3 * S::HIDDEN) * 2)?,
+            region: q.slice(
+                r as usize * qkv_stride::<S>() * 2,
+                16 * qkv_stride::<S>() * 2,
+            )?,
             value: 0,
         }];
         let mut add = |kernel: usize,
@@ -641,7 +659,7 @@ pub(crate) fn buffer_sizes<M: EncoderSpec>(batch: usize, tokens: usize) -> Resul
     Ok([
         product(&[rows, M::HIDDEN, if M::RESIDUAL_F32 { 4 } else { 2 }])?,
         product(&[rows, M::HIDDEN, 2])?,
-        product(&[padded, 3, M::HIDDEN, 2])?,
+        product(&[padded, qkv_stride::<M>(), 2])?,
         product(&[rows, M::HIDDEN, 2])?,
         product(&[rows, M::INTERMEDIATE, 2])?,
         product(&[rows, M::HIDDEN, 4])?,
@@ -649,14 +667,38 @@ pub(crate) fn buffer_sizes<M: EncoderSpec>(batch: usize, tokens: usize) -> Resul
         projected,
     ])
 }
-// Batch-16 measurements favor a balanced tile for H+ and more token reuse for 7B.
+// Padding power-of-two rows avoids the memory-access conflicts measured on gfx1151.
+pub(crate) fn qkv_stride<M: EncoderSpec>() -> usize {
+    3 * M::HIDDEN
+        + if M::HIDDEN >= 1024 && M::HIDDEN.is_power_of_two() {
+            64
+        } else {
+            0
+        }
+}
+fn weight_stride<M: EncoderSpec>(k: usize) -> usize {
+    k + if M::RESIDUAL_F32 && k >= 1024 && k.is_power_of_two() {
+        64
+    } else {
+        0
+    }
+}
+fn pad_weight_rows(bytes: Vec<u8>, k: usize, stride: usize) -> Vec<u8> {
+    if stride == k {
+        return bytes;
+    }
+    let mut padded = vec![0; bytes.len() / (k * 2) * stride * 2];
+    for (src, dst) in bytes
+        .chunks_exact(k * 2)
+        .zip(padded.chunks_exact_mut(stride * 2))
+    {
+        dst[..src.len()].copy_from_slice(src);
+    }
+    padded
+}
 fn projection_tile<M: EncoderSpec>() -> (u32, usize) {
     if M::RESIDUAL_F32 && M::GATED {
-        if M::HIDDEN >= 2048 {
-            (256, 64)
-        } else {
-            (128, 128)
-        }
+        (128, 128)
     } else {
         (64, 64)
     }
@@ -675,6 +717,15 @@ pub(crate) fn specifications<M: EncoderSpec>(
         $(spec.set_config(concat!("dinov3.",$ns,".",$k),$v.to_string());)*
         s.push((include_str!(concat!("../kernels/",$file,".loom")),spec));
     }}; }
+    // H+ keeps the released schedule: register prefetch regressed batch-16
+    // throughput for its 1280/5120 dimensions in paired measurements.
+    macro_rules! wide_spec { ([$($k:literal => $v:expr),*]) => {{
+        if M::HIDDEN == 1280 && M::INTERMEDIATE == 5120 {
+            spec!("matmul_wide_wmma","matmul_wide_wmma",["tile_rows"=>128,$($k=>$v),*]);
+        } else {
+            spec!("matmul_prefetch_wmma","matmul_wide_wmma",[$($k=>$v),*]);
+        }
+    }}; }
     if !M::RESIDUAL_F32 && M::HIDDEN <= 384 {
         spec!("layernorm_rowwave_f16","layernorm_rowwave_f16",["hidden_size"=>M::HIDDEN,"epsilon"=>options.epsilon]);
         spec!("layernorm_rowwave_f32out","layernorm_rowwave_f32out",["hidden_size"=>M::HIDDEN,"epsilon"=>options.epsilon]);
@@ -689,38 +740,38 @@ pub(crate) fn specifications<M: EncoderSpec>(
         spec!("layernorm_encoder","layernorm_encoder",["hidden_size"=>M::HIDDEN,"epsilon"=>options.epsilon,"input_f32"=>usize::from(M::RESIDUAL_F32),"output_f32"=>1]);
     }
     if wide {
-        spec!("matmul_wide_wmma","matmul_wide_wmma",["max_rows"=>options.max_batch*options.tokens_per_sequence,"tile_rows"=>projection_tile::<M>().0,"k_size"=>M::HIDDEN,"n_size"=>3*M::HIDDEN,"splits"=>1,"epilogue"=>0]);
+        wide_spec!(["weight_stride"=>weight_stride::<M>(M::HIDDEN),"max_rows"=>options.max_batch*options.tokens_per_sequence,"k_size"=>M::HIDDEN,"n_size"=>3*M::HIDDEN,"splits"=>1,"epilogue"=>0]);
     } else if separate_qkv::<M>() {
-        spec!("matmul_qkv_f32out","matmul_qkv_f32out",["k_size"=>M::HIDDEN,"n_size"=>3*M::HIDDEN]);
+        spec!("matmul_qkv_f32out","matmul_qkv_f32out",["weight_stride"=>weight_stride::<M>(M::HIDDEN),"k_size"=>M::HIDDEN,"n_size"=>3*M::HIDDEN]);
     } else {
-        spec!("matmul_qkv_rope_f16_wmma","matmul_qkv_rope_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>3*M::HIDDEN,"head_dim"=>64,"prefix"=>options.prefix_tokens,"tokens_per_image"=>options.tokens_per_sequence,"rope_channels"=>2*M::HIDDEN]);
+        spec!("matmul_qkv_rope_f16_wmma","matmul_qkv_rope_f16_wmma",["weight_stride"=>weight_stride::<M>(M::HIDDEN),"k_size"=>M::HIDDEN,"n_size"=>3*M::HIDDEN,"head_dim"=>64,"prefix"=>options.prefix_tokens,"tokens_per_image"=>options.tokens_per_sequence,"rope_channels"=>2*M::HIDDEN,"output_stride"=>qkv_stride::<M>()]);
     }
     if M::HEAD_DIM == 64 {
-        spec!("attention_online_f16_wmma_cf16","attention_online_f16_wmma_cf16",["hidden_size"=>M::HIDDEN,"qkv_stride"=>3*M::HIDDEN,"tokens_per_image"=>options.tokens_per_sequence,"scale"=>0.125,"max_images"=>options.max_batch,"token_capacity"=>(options.max_batch*options.tokens_per_sequence+16).next_multiple_of(16)]);
+        spec!("attention_online_f16_wmma_cf16","attention_online_f16_wmma_cf16",["hidden_size"=>M::HIDDEN,"qkv_stride"=>qkv_stride::<M>(),"tokens_per_image"=>options.tokens_per_sequence,"scale"=>0.125,"max_images"=>options.max_batch,"token_capacity"=>(options.max_batch*options.tokens_per_sequence+16).next_multiple_of(16)]);
     } else {
-        spec!("attention_online_f16_wmma_h128","attention_online_f16_wmma_h128",["hidden_size"=>M::HIDDEN,"qkv_stride"=>3*M::HIDDEN,"tokens_per_image"=>options.tokens_per_sequence,"scale"=>1.0_f64/128.0_f64.sqrt(),"max_images"=>options.max_batch,"token_capacity"=>(options.max_batch*options.tokens_per_sequence+16).next_multiple_of(16)]);
+        spec!("attention_online_f16_wmma_h128","attention_online_f16_wmma_h128",["hidden_size"=>M::HIDDEN,"qkv_stride"=>qkv_stride::<M>(),"tokens_per_image"=>options.tokens_per_sequence,"scale"=>1.0_f64/128.0_f64.sqrt(),"max_images"=>options.max_batch,"token_capacity"=>(options.max_batch*options.tokens_per_sequence+16).next_multiple_of(16)]);
     }
     if wide {
-        spec!("matmul_wide_wmma","matmul_wide_wmma",["max_rows"=>options.max_batch*options.tokens_per_sequence,"tile_rows"=>projection_tile::<M>().0,"k_size"=>M::HIDDEN,"n_size"=>M::HIDDEN,"splits"=>1,"epilogue"=>2]);
-        spec!("matmul_wide_wmma","matmul_wide_wmma",["max_rows"=>options.max_batch*options.tokens_per_sequence,"tile_rows"=>projection_tile::<M>().0,"k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN,"splits"=>1,"epilogue"=>2]);
+        wide_spec!(["weight_stride"=>weight_stride::<M>(M::HIDDEN),"max_rows"=>options.max_batch*options.tokens_per_sequence,"k_size"=>M::HIDDEN,"n_size"=>M::HIDDEN,"splits"=>1,"epilogue"=>2]);
+        wide_spec!(["weight_stride"=>weight_stride::<M>(M::INTERMEDIATE),"max_rows"=>options.max_batch*options.tokens_per_sequence,"k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN,"splits"=>1,"epilogue"=>2]);
     } else if M::RESIDUAL_F32 {
-        spec!("matmul_resid_f32_wmma","matmul_resid_f32_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::HIDDEN]);
-        spec!("matmul_resid_f32_wmma","matmul_resid_f32_wmma",["k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN]);
+        spec!("matmul_resid_f32_wmma","matmul_resid_f32_wmma",["weight_stride"=>weight_stride::<M>(M::HIDDEN),"k_size"=>M::HIDDEN,"n_size"=>M::HIDDEN]);
+        spec!("matmul_resid_f32_wmma","matmul_resid_f32_wmma",["weight_stride"=>weight_stride::<M>(M::INTERMEDIATE),"k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN]);
     } else {
         spec!("matmul_resid_f16_wmma","matmul_resid_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::HIDDEN]);
         spec!("matmul_resid_f16_wmma","matmul_resid_f16_wmma",["k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN]);
     }
     if wide {
-        spec!("matmul_wide_wmma","matmul_wide_wmma",["max_rows"=>options.max_batch*options.tokens_per_sequence,"tile_rows"=>projection_tile::<M>().0,"k_size"=>M::HIDDEN,"n_size"=>if M::GATED {2*M::INTERMEDIATE} else {M::INTERMEDIATE},"splits"=>1,"epilogue"=>if M::GATED {0} else {1}]);
+        wide_spec!(["weight_stride"=>weight_stride::<M>(M::HIDDEN),"max_rows"=>options.max_batch*options.tokens_per_sequence,"k_size"=>M::HIDDEN,"n_size"=>if M::GATED {2*M::INTERMEDIATE} else {M::INTERMEDIATE},"splits"=>1,"epilogue"=>if M::GATED {0} else {1}]);
     } else if M::GATED {
         spec!("matmul_swiglu_f16_wmma","matmul_swiglu_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::INTERMEDIATE]);
     } else {
-        spec!("matmul_gelu_f16_wmma","matmul_gelu_f16_wmma",["k_size"=>M::HIDDEN,"n_size"=>M::INTERMEDIATE]);
+        spec!("matmul_gelu_f16_wmma","matmul_gelu_f16_wmma",["weight_stride"=>weight_stride::<M>(M::HIDDEN),"k_size"=>M::HIDDEN,"n_size"=>M::INTERMEDIATE]);
     }
     if wide {
-        spec!("matmul_wide_wmma","matmul_wide_wmma",["max_rows"=>options.tokens_per_sequence,"tile_rows"=>projection_tile::<M>().0,"k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN,"splits"=>4,"epilogue"=>0]);
+        wide_spec!(["weight_stride"=>weight_stride::<M>(M::INTERMEDIATE),"max_rows"=>options.tokens_per_sequence,"k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN,"splits"=>4,"epilogue"=>0]);
     } else {
-        spec!("matmul_splitk_f16_wmma","matmul_splitk_f16_wmma",["k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN,"splits"=>4]);
+        spec!("matmul_splitk_f16_wmma","matmul_splitk_f16_wmma",["weight_stride"=>weight_stride::<M>(M::INTERMEDIATE),"k_size"=>M::INTERMEDIATE,"n_size"=>M::HIDDEN,"splits"=>4]);
     }
     if M::RESIDUAL_F32 {
         spec!("splitk_reduce_f32","splitk_reduce_f32",["n_size"=>M::HIDDEN,"splits"=>4]);
@@ -728,7 +779,7 @@ pub(crate) fn specifications<M: EncoderSpec>(
         spec!("splitk_reduce_f16","splitk_reduce_f16",["n_size"=>M::HIDDEN,"splits"=>4]);
     }
     if separate_qkv::<M>() {
-        spec!("rope_f32_to_f16","rope_f32_to_f16",["hidden_size"=>M::HIDDEN,"max_rows"=>options.max_batch*options.tokens_per_sequence,"head_dim"=>M::HEAD_DIM,"tokens_per_image"=>options.tokens_per_sequence,"prefix"=>options.prefix_tokens]);
+        spec!("rope_f32_to_f16","rope_f32_to_f16",["hidden_size"=>M::HIDDEN,"max_rows"=>options.max_batch*options.tokens_per_sequence,"head_dim"=>M::HEAD_DIM,"tokens_per_image"=>options.tokens_per_sequence,"prefix"=>options.prefix_tokens,"output_stride"=>qkv_stride::<M>()]);
         if wide {
             spec!("swiglu_f32_to_f16","swiglu_f32_to_f16",["width"=>M::INTERMEDIATE,"max_rows"=>options.max_batch*options.tokens_per_sequence]);
         }

@@ -338,6 +338,7 @@ fn downstream_encoder_specs_match_reference_and_compose_in_caller_graphs() -> Re
     check::<Gated>(&context, true, false, 33, 3)?;
     check::<WideHead>(&context, true, true, 33, 3)?;
     check::<WideHead>(&context, true, false, 17, 0)?;
+    check::<WideHead>(&context, false, false, 1, 0)?;
     check::<PlainWideHead>(&context, false, false, 33, 3)?;
     check::<PlainWideHead>(&context, true, false, 257, 64)
 }

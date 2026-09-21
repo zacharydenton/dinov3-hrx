@@ -5,6 +5,7 @@ config.decl @dinov3.rope_f32_to_f16.head_dim : %value: index where [range(%value
 config.decl @dinov3.rope_f32_to_f16.tokens_per_image : %value: index where [range(%value,1,1024)]
 config.decl @dinov3.rope_f32_to_f16.prefix : %value: index where [range(%value,0,64)]
 config.decl @dinov3.rope_f32_to_f16.max_rows : %value: index where [range(%value,1,1048560)]
+config.decl @dinov3.rope_f32_to_f16.output_stride : %value: index where [range(%value,64,32768),mul(%value,64)]
 kernel.def target(@rope128_target) export("dinov3_rope_f32_to_f16") @dinov3_rope_f32_to_f16(%rows:index) {
  %one=index.constant 1 : index
  %three=index.constant 3 : index
@@ -31,6 +32,7 @@ kernel.def target(@rope128_target) export("dinov3_rope_f32_to_f16") @dinov3_rope
  %threads=index.constant 256 : index
  %h=config.get @dinov3.rope_f32_to_f16.hidden_size : index
  %stride=index.mul %h,%three : index
+ %output_stride=config.get @dinov3.rope_f32_to_f16.output_stride : index
  %rope_channels=index.mul %h,%two : index
  %count=index.mul %rows,%stride : index
  %max_rows=config.get @dinov3.rope_f32_to_f16.max_rows : index
@@ -42,14 +44,16 @@ kernel.def target(@rope128_target) export("dinov3_rope_f32_to_f16") @dinov3_rope
  %valid=index.cmp ult,%raw,%count : index
  scf.if %valid {
   %i=index.assume %raw [lt(%raw,%count)] : index
-  %row=index.div %i,%stride : index
-  %channel=index.rem %i,%stride : index
+  %row0=index.div %i,%stride : index
+  %row=index.assume %row0 [range(%row0,0,1048559),lt(%row0,%rows)] : index
+  %channel0=index.rem %i,%stride : index
+  %channel=index.assume %channel0 [lt(%channel0,%output_stride)] : index
   %local=index.rem %row,%tokens : index
   %past=index.cmp uge,%local,%five : index
   %qk=index.cmp ult,%channel,%rope_channels : index
   %rotate=scalar.andi %past,%qk : i1
   %iv=buffer.view %input[%off] : buffer -> view<[%count]xf32>
-  %ov=buffer.view %output[%off] : buffer -> view<[%count]xf16>
+  %ov=buffer.view %output[%off] : buffer -> view<[%rows]x[%output_stride]xf16>
   %v=view.load %iv[%i] : view<[%count]xf32> -> f32
   %result=scf.if %rotate -> (f32) {
    %c=index.rem %channel,%head : index
@@ -73,7 +77,7 @@ kernel.def target(@rope128_target) export("dinov3_rope_f32_to_f16") @dinov3_rope
    scf.yield %rotated : f32
   } else { scf.yield %v : f32 }
   %narrow=scalar.fptrunc %result : f32 to f16
-  view.store %narrow,%ov[%i] : f16,view<[%count]xf16>
+  view.store %narrow,%ov[%row,%channel] : f16,view<[%rows]x[%output_stride]xf16>
  }
  kernel.return
 }
