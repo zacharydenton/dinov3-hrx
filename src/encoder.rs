@@ -156,10 +156,20 @@ impl<S: EncoderSpec> Encoder<S> {
             };
             weights.insert(name, model.weight(&bytes)?);
         }
-        let a = buffer_sizes::<S>(options.max_batch, options.tokens_per_sequence)?
+        let mut a: Vec<Region> = Vec::new();
+        for (index, bytes) in buffer_sizes::<S>(options.max_batch, options.tokens_per_sequence)?
             .into_iter()
-            .map(|bytes| model.allocate(bytes))
-            .collect::<hrx::Result<_>>()?;
+            .enumerate()
+        {
+            // QKV consumes normalized activations before attention writes its
+            // output. Projection consumes that output before the next norm.
+            // Both regions have the same shape and never share a dispatch.
+            a.push(if index == 3 {
+                a[1]
+            } else {
+                model.allocate(bytes)?
+            });
+        }
         // Embedded kernels, validated dimensions, and matching binding contracts below.
         let kernels = unsafe { model.compile(&specifications::<S>(options))? };
         Ok(Self {
@@ -276,7 +286,9 @@ fn validate<S: EncoderSpec>(o: EncoderOptions) -> Result<()> {
     let sizes = buffer_sizes::<S>(o.max_batch, o.tokens_per_sequence)?;
     let workspace = sizes
         .iter()
-        .try_fold(0usize, |total, &bytes| total.checked_add(bytes))
+        .enumerate()
+        .filter(|(index, _)| *index != 3) // Attention aliases normalized activations.
+        .try_fold(0usize, |total, (_, &bytes)| total.checked_add(bytes))
         .ok_or_else(|| anyhow::anyhow!("encoder workspace byte count overflow"))?;
     ensure!(
         workspace <= o.max_workspace_bytes,
@@ -865,6 +877,8 @@ mod tests {
         let bytes = buffer_sizes::<Taste>(1024, 32)
             .unwrap()
             .into_iter()
+            .enumerate()
+            .filter_map(|(index, bytes)| (index != 3).then_some(bytes))
             .sum::<usize>();
         assert!(bytes < o.max_workspace_bytes);
         let exact = EncoderOptions {
