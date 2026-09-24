@@ -77,6 +77,7 @@ fn run<M: ModelSpec>(args: Args) -> Result<()> {
     }
     let after = model.context().runtime().statistics();
     let output = run()?;
+    ensure!(output.iter().all(|v| v.is_finite()), "nonfinite output");
     if let Some(path) = args.output {
         std::fs::write(path, bytemuck::cast_slice(&output))?;
     }
@@ -87,6 +88,8 @@ fn run<M: ModelSpec>(args: Args) -> Result<()> {
         "median_ms":times[samples/2],"images_per_second":(batch*samples) as f64*1000./times.iter().sum::<f64>(),
         "ms_per_image":times[samples/2]/batch as f64,"p95_ms":times[(samples*95).div_ceil(100)-1],
         "download_bytes_per_call":(after.downloaded_bytes-before.downloaded_bytes)/samples as u64,
+        "live_bytes":after.live_bytes,"peak_bytes":after.peak_bytes,
+        "warm_allocations":after.allocations-before.allocations,
         "warm_ms":times})
     );
     Ok(())
