@@ -204,3 +204,10 @@ tests cover wide LayerNorm with F32 outliers, erf-based GELU, 128-channel attent
 and RoPE, partial tiles, mixed-model graph composition, and descriptor masks.
 ViT-S+/ViT-B tests exercise warm replay through batch 64. ViT-7B tests need the
 large checkpoint and enough host/device memory for the model and F64 reference.
+
+## Runtime
+
+Requires HRX 0.10.1. Encoder graphs use compiler-authored launch dimensions,
+including split-K projections and 64/128-channel attention heads. Launch metadata
+is evaluated during graph preparation and reused for inference. Attention and
+projection accumulation remain FP32.

@@ -403,8 +403,6 @@ impl<S: EncoderSpec> Encoder<S> {
         );
         let r = (b * self.options.tokens_per_sequence) as u32;
         let wide = S::RESIDUAL_F32 && S::GATED;
-        let (tile_rows, tile_cols) = projection_tile::<S>();
-        let projection_rows = r.div_ceil(tile_rows);
         let sizes = buffer_sizes::<S>(b, self.options.tokens_per_sequence)?;
         let shaped = self
             .a
@@ -424,10 +422,10 @@ impl<S: EncoderSpec> Encoder<S> {
         }];
         let mut add = |kernel: usize,
                        scalar: u32,
-                       grid: [u32; 3],
                        bindings: Vec<Region>,
                        output: Region,
-                       reads_output: bool| {
+                       reads_output: bool|
+         -> Result<()> {
             let bindings = bindings
                 .into_iter()
                 .map(|region| {
@@ -442,21 +440,27 @@ impl<S: EncoderSpec> Encoder<S> {
                     }
                 })
                 .collect();
+            // Attention has a launch-only head-count argument; the device
+            // entry still takes only the token count.
+            let workload = [u64::from(scalar), S::HEADS as u64];
+            let workload = if kernel == 3 {
+                &workload[..]
+            } else {
+                &workload[..1]
+            };
+            let grid = self
+                .engine
+                .launch_config(self.kernels[kernel], workload)?
+                .workgroup_count;
             commands.push(Command::Dispatch(Dispatch::indices(
                 self.kernels[kernel],
                 [scalar],
                 grid,
                 bindings,
             )));
+            Ok(())
         };
-        add(
-            0,
-            r,
-            [r.div_ceil(8), 1, 1],
-            vec![x, w("l0_norm1_w"), w("l0_norm1_b"), h],
-            h,
-            false,
-        );
+        add(0, r, vec![x, w("l0_norm1_w"), w("l0_norm1_b"), h], h, false)?;
         for i in 0..S::LAYERS {
             let s = format!("l{i}_");
             let wt = |suffix: &str| w(&(s.clone() + suffix));
@@ -464,18 +468,16 @@ impl<S: EncoderSpec> Encoder<S> {
                 add(
                     2,
                     r,
-                    [(3 * S::HIDDEN / 64) as u32, r.div_ceil(64), 1],
                     vec![h, wt("qkv_w"), wt("qkv_b"), q, w("rope_cos"), w("rope_sin")],
                     q,
                     false,
-                );
+                )?;
             } else {
                 // The wide kernel's fifth binding is LayerScale. Projection
                 // specializations ignore it, so reuse their valid bias region.
                 add(
                     2,
                     r,
-                    [(3 * S::HIDDEN / tile_cols) as u32, projection_rows, 1],
                     if wide {
                         vec![h, wt("qkv_w"), wt("qkv_b"), projected, wt("qkv_b")]
                     } else {
@@ -483,77 +485,47 @@ impl<S: EncoderSpec> Encoder<S> {
                     },
                     projected,
                     false,
-                );
+                )?;
                 add(
                     9,
                     r,
-                    [(r as usize * 3 * S::HIDDEN).div_ceil(256) as u32, 1, 1],
                     vec![projected, w("rope_cos"), w("rope_sin"), q],
                     q,
                     false,
-                );
+                )?;
             }
             let k = q.slice(S::HIDDEN * 2, q.len() - S::HIDDEN * 2)?;
             let v = q.slice(S::HIDDEN * 4, q.len() - S::HIDDEN * 4)?;
-            add(
-                3,
-                r,
-                [
-                    (b * self.options.tokens_per_sequence.div_ceil(16)) as u32,
-                    S::HEADS as u32,
-                    1,
-                ],
-                vec![q, k, v, attn],
-                attn,
-                false,
-            );
+            add(3, r, vec![q, k, v, attn], attn, false)?;
             add(
                 4,
                 r,
-                [(S::HIDDEN / tile_cols) as u32, projection_rows, 1],
                 vec![attn, wt("o_w"), wt("o_b"), x, wt("ls1")],
                 x,
                 true,
-            );
-            add(
-                0,
-                r,
-                [r.div_ceil(8), 1, 1],
-                vec![x, wt("norm2_w"), wt("norm2_b"), h],
-                h,
-                false,
-            );
+            )?;
+            add(0, r, vec![x, wt("norm2_w"), wt("norm2_b"), h], h, false)?;
             if wide && S::GATED {
                 add(
                     6,
                     r,
-                    [(2 * S::INTERMEDIATE / tile_cols) as u32, projection_rows, 1],
                     vec![h, wt("gateup_w"), wt("gateup_b"), projected, wt("gateup_b")],
                     projected,
                     false,
-                );
-                add(
-                    10,
-                    r,
-                    [(r as usize * S::INTERMEDIATE).div_ceil(1024) as u32, 1, 1],
-                    vec![projected, act],
-                    act,
-                    false,
-                );
+                )?;
+                add(10, r, vec![projected, act], act, false)?;
             } else if wide {
                 add(
                     6,
                     r,
-                    [(S::INTERMEDIATE / tile_cols) as u32, projection_rows, 1],
                     vec![h, wt("up_w"), wt("up_b"), act, wt("up_b")],
                     act,
                     false,
-                );
+                )?;
             } else {
                 add(
                     6,
                     r,
-                    [(S::INTERMEDIATE / 64) as u32, r.div_ceil(64), 1],
                     vec![
                         h,
                         wt(if S::GATED { "gateup_w" } else { "up_w" }),
@@ -562,13 +534,12 @@ impl<S: EncoderSpec> Encoder<S> {
                     ],
                     act,
                     false,
-                );
+                )?;
             }
             if b == 1 {
                 add(
                     7,
                     r,
-                    [(S::HIDDEN / tile_cols) as u32, projection_rows, 4],
                     if wide {
                         vec![act, wt("down_w"), wt("down_b"), partials, wt("ls2")]
                     } else {
@@ -576,30 +547,21 @@ impl<S: EncoderSpec> Encoder<S> {
                     },
                     partials,
                     false,
-                );
-                add(
-                    8,
-                    r,
-                    [r, 1, 1],
-                    vec![partials, wt("down_b"), x, wt("ls2")],
-                    x,
-                    true,
-                );
+                )?;
+                add(8, r, vec![partials, wt("down_b"), x, wt("ls2")], x, true)?;
             } else {
                 add(
                     5,
                     r,
-                    [(S::HIDDEN / tile_cols) as u32, projection_rows, 1],
                     vec![act, wt("down_w"), wt("down_b"), x, wt("ls2")],
                     x,
                     true,
-                );
+                )?;
             }
             if i + 1 < S::LAYERS {
                 add(
                     0,
                     r,
-                    [r.div_ceil(8), 1, 1],
                     vec![
                         x,
                         w(&format!("l{}_norm1_w", i + 1)),
@@ -608,17 +570,10 @@ impl<S: EncoderSpec> Encoder<S> {
                     ],
                     h,
                     false,
-                );
+                )?;
             }
         }
-        add(
-            1,
-            r,
-            [r.div_ceil(8), 1, 1],
-            vec![x, w("norm_w"), w("norm_b"), out],
-            out,
-            false,
-        );
+        add(1, r, vec![x, w("norm_w"), w("norm_b"), out], out, false)?;
         // The embedded kernels obey the scalar, region and access contracts above.
         // Every private activation is written before use; QKV padding is filled
         // above. Residual and split-K paths need no initial scratch contents.
@@ -707,13 +662,6 @@ fn pad_weight_rows(bytes: Vec<u8>, k: usize, stride: usize) -> Vec<u8> {
         dst[..src.len()].copy_from_slice(src);
     }
     padded
-}
-fn projection_tile<M: EncoderSpec>() -> (u32, usize) {
-    if M::RESIDUAL_F32 && M::GATED {
-        (128, 128)
-    } else {
-        (64, 64)
-    }
 }
 fn separate_qkv<M: EncoderSpec>() -> bool {
     (M::RESIDUAL_F32 && M::GATED) || M::HEAD_DIM == 128 || M::HIDDEN > 8192 / 3
